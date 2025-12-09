@@ -10,6 +10,9 @@ Key Components:
 - FourierMzEmbedding: Fourier positional embeddings for m/z values
 - Spec2GraphDiffusion: Transformer + diffusion denoiser model
 - DiffusionTrainer: Training loop with DDPM schedule and sampling
+
+Usage Example:
+    Run `python spectral_diffusion.py` to see a complete example.
 """
 
 import math
