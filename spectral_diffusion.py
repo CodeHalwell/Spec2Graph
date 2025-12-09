@@ -690,7 +690,7 @@ def create_benzene_demo_data() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     eigenvectors = processor.process_smiles(smiles)
 
     # Simulated mass spectrum for benzene (MW ~78)
-    # Major peaks: molecular ion (78), loss of H (77), C4H3 (51), C3H3 (39)
+    # Major peaks: molecular ion (78), loss of H (77), C4H3 (51), C3H3 (39) -- common fragmentation patterns for benzene in mass spectrometry (m/z values in parentheses)
     mz_values = np.array([39.0, 50.0, 51.0, 52.0, 63.0, 74.0, 76.0, 77.0, 78.0, 79.0])
     intensities = np.array([0.3, 0.1, 0.4, 0.15, 0.1, 0.05, 0.2, 0.6, 1.0, 0.1])
 
