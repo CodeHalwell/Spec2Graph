@@ -119,8 +119,12 @@ class SpectralDataProcessor:
         if canonicalize:
             for i in range(selected.shape[1]):
                 col = selected[:, i]
-                first_nonzero_idx = np.argmax(np.abs(col) > 1e-10)
-                if col[first_nonzero_idx] < 0:
+                abs_col = np.abs(col)
+                if np.any(abs_col > 1e-10):
+                    idx = np.argmax(abs_col > 1e-10)
+                else:
+                    idx = np.argmax(abs_col)
+                if col[idx] < 0:
                     selected[:, i] = -col
 
         # Pad with zeros if needed
