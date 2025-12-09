@@ -108,7 +108,7 @@ class SpectralDataProcessor:
         # Skip it if the smallest eigenvalue is close to zero.
         n_atoms = laplacian.shape[0]
         eps = 1e-9
-        start_idx = 1 if eigenvalues[0] < eps and n_atoms > self.k else 0
+        start_idx = 1 if eigenvalues[0] < eps else 0
 
         # Extract k eigenvectors starting from start_idx
         k_actual = min(self.k, n_atoms - start_idx)
