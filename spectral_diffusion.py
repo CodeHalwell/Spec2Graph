@@ -19,6 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
+from rdkit import Chem
+
 
 class SpectralDataProcessor:
     """Processes molecular SMILES to spectral graph representations."""
@@ -42,8 +44,6 @@ class SpectralDataProcessor:
         Returns:
             Adjacency matrix as numpy array
         """
-        from rdkit import Chem
-
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
@@ -70,8 +70,9 @@ class SpectralDataProcessor:
             Normalized Laplacian matrix
         """
         degree = np.sum(adjacency, axis=1)
-        # Avoid division by zero
-        degree_inv_sqrt = np.where(degree > 0, 1.0 / np.sqrt(degree), 0.0)
+        # Avoid division by zero using epsilon for numerical stability
+        eps = 1e-12
+        degree_inv_sqrt = np.where(degree > eps, 1.0 / np.sqrt(degree), 0.0)
         D_inv_sqrt = np.diag(degree_inv_sqrt)
 
         # Normalized Laplacian: I - D^(-1/2) A D^(-1/2)
@@ -97,15 +98,18 @@ class SpectralDataProcessor:
 
         # Sort by eigenvalues (ascending - smallest first)
         idx = np.argsort(eigenvalues)
+        eigenvalues = eigenvalues[idx]
         eigenvectors = eigenvectors[:, idx]
 
-        # Extract top k eigenvectors (skip first if it's the constant eigenvector)
+        # For connected graphs, the first eigenvalue is zero (constant eigenvector).
+        # Skip it if the smallest eigenvalue is close to zero.
         n_atoms = laplacian.shape[0]
-        k_actual = min(self.k, n_atoms)
+        eps = 1e-9
+        start_idx = 1 if eigenvalues[0] < eps and n_atoms > self.k else 0
 
-        # Start from index 1 to skip the constant eigenvector
-        start_idx = 1 if n_atoms > self.k else 0
-        end_idx = min(start_idx + k_actual, n_atoms)
+        # Extract k eigenvectors starting from start_idx
+        k_actual = min(self.k, n_atoms - start_idx)
+        end_idx = start_idx + k_actual
         selected = eigenvectors[:, start_idx:end_idx]
 
         # Sign canonicalization: ensure first non-zero element is positive

@@ -36,7 +36,7 @@ pip install -r requirements.txt
 ### Requirements
 
 - Python 3.8+
-- PyTorch >= 2.0.0
+- PyTorch >= 2.6.0
 - NumPy >= 1.20.0
 - RDKit >= 2023.3.1
 
