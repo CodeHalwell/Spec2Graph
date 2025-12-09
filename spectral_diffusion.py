@@ -101,7 +101,7 @@ class SpectralDataProcessor:
         eigenvalues = eigenvalues[idx]
         eigenvectors = eigenvectors[:, idx]
 
-        # For connected graphs, the first eigenvalue is zero (constant eigenvector).
+        # For connected graphs, the smallest eigenvalue of the normalized Laplacian is zero, corresponding to the constant eigenvector.
         # Skip it if the smallest eigenvalue is close to zero.
         n_atoms = laplacian.shape[0]
         eps = 1e-9
