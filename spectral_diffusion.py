@@ -486,8 +486,9 @@ class DiffusionTrainer:
         self.sqrt_alpha_cumprod = torch.sqrt(self.alpha_cumprod)
         self.sqrt_one_minus_alpha_cumprod = torch.sqrt(1.0 - self.alpha_cumprod)
         self.sqrt_recip_alpha = torch.sqrt(1.0 / self.alphas)
+        # Add small epsilon to denominator for numerical stability (avoids div by zero at t=0)
         self.posterior_variance = (
-            self.betas * (1.0 - self.alpha_cumprod_prev) / (1.0 - self.alpha_cumprod)
+            self.betas * (1.0 - self.alpha_cumprod_prev) / (1.0 - self.alpha_cumprod + 1e-8)
         )
 
     def q_sample(
