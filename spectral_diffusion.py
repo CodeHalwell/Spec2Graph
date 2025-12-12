@@ -20,7 +20,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
+import warnings
+
+# Numerical floor to avoid divide-by-zero when reconstructing clean samples
+PROJECTION_EPS = 1e-8
+# Threshold above which projection matrices become memory-heavy (n_atoms^2)
+PROJECTION_WARNING_THRESHOLD = 256
+# Emit projection warning only once to avoid log spam during training
+PROJECTION_WARNING_EMITTED = False
 
 from rdkit import Chem
 
@@ -134,19 +142,49 @@ class SpectralDataProcessor:
 
         return selected.astype(np.float32)
 
-    def process_smiles(self, smiles: str) -> np.ndarray:
+    def projection_matrix(self, eigenvectors: np.ndarray) -> np.ndarray:
         """
-        Full pipeline: SMILES to spectral embedding.
+        Compute the spectral projection matrix P_k = V_k V_k^T to obtain a
+        subspace-invariant target (robust to sign flips and degenerate eigenspaces).
+
+        Args:
+            eigenvectors: Eigenvector matrix of shape (n_atoms, k)
+
+        Returns:
+            Projection matrix of shape (n_atoms, n_atoms)
+
+        Note:
+            This validates only dimensionality (2D); callers are responsible for
+            providing semantically correct (n_atoms, k) inputs.
+        """
+        if eigenvectors.ndim != 2:
+            raise ValueError(
+                f"eigenvectors must be 2D (n_atoms, k), got {eigenvectors.ndim}D with shape {eigenvectors.shape}"
+            )
+        return (eigenvectors @ eigenvectors.T).astype(np.float32)
+
+    def process_smiles(
+        self, smiles: str, return_projection: bool = False
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Full pipeline: SMILES to spectral embedding (and optionally projection).
 
         Args:
             smiles: SMILES string
+            return_projection: If True, also return P_k = V_k V_k^T
 
         Returns:
-            Spectral embedding of shape (n_atoms, k)
+            Spectral embedding of shape (n_atoms, k) or a tuple
+            (eigenvectors, projection_matrix)
         """
         adjacency = self.smiles_to_adjacency(smiles)
         laplacian = self.compute_laplacian(adjacency)
         eigenvectors = self.extract_eigenvectors(laplacian)
+
+        if return_projection:
+            projection = self.projection_matrix(eigenvectors)
+            return eigenvectors, projection
+
         return eigenvectors
 
 
@@ -468,6 +506,7 @@ class DiffusionTrainer:
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
         device: str = "cpu",
+        projection_loss_weight: float = 1.0,
     ):
         """
         Initialize the diffusion trainer.
@@ -478,10 +517,12 @@ class DiffusionTrainer:
             beta_start: Starting beta value
             beta_end: Ending beta value
             device: Device to use
+            projection_loss_weight: Weight for subspace-invariant projection loss
         """
         self.model = model
         self.n_timesteps = n_timesteps
         self.device = device
+        self.projection_loss_weight = projection_loss_weight
 
         # DDPM schedule
         self.betas = torch.linspace(beta_start, beta_end, n_timesteps).to(device)
@@ -492,6 +533,12 @@ class DiffusionTrainer:
         # Pre-compute useful values
         self.sqrt_alpha_cumprod = torch.sqrt(self.alpha_cumprod)
         self.sqrt_one_minus_alpha_cumprod = torch.sqrt(1.0 - self.alpha_cumprod)
+        self.sqrt_alpha_cumprod_clamped = torch.clamp(
+            self.sqrt_alpha_cumprod, min=PROJECTION_EPS
+        )
+        self.sqrt_one_minus_alpha_cumprod_clamped = torch.clamp(
+            self.sqrt_one_minus_alpha_cumprod, min=PROJECTION_EPS
+        )
         self.sqrt_recip_alpha = torch.sqrt(1.0 / self.alphas)
         # Add small epsilon to denominator for numerical stability (avoids div by zero at t=0)
         self.posterior_variance = (
@@ -520,6 +567,58 @@ class DiffusionTrainer:
 
         x_t = sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
         return x_t, noise
+
+    @staticmethod
+    def projection_from_embeddings(
+        embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute projection matrix P_k = E E^T for a batch of embeddings,
+        optionally masking out padded atoms. Masked atoms are zeroed before the
+        projection is computed; the input tensor is not modified in place. If
+        ``mask`` is None, all atoms are treated as valid. This materialises a
+        (batch, n_atoms, n_atoms) tensor, which can be memory intensive for
+        large n_atoms; consider chunking if scaling up.
+
+        Args:
+            embeddings: Tensor of shape (batch, n_atoms, k)
+            mask: Optional boolean mask of shape (batch, n_atoms)
+
+        Returns:
+            Projection matrices of shape (batch, n_atoms, n_atoms)
+        """
+        n_atoms = embeddings.shape[1]
+        global PROJECTION_WARNING_EMITTED
+        if n_atoms > PROJECTION_WARNING_THRESHOLD and not PROJECTION_WARNING_EMITTED:
+            warnings.warn(
+                "projection_from_embeddings materialises a (batch, n_atoms, n_atoms) tensor; "
+                f"consider chunking when n_atoms > {PROJECTION_WARNING_THRESHOLD}.",
+                RuntimeWarning,
+            )
+            PROJECTION_WARNING_EMITTED = True
+
+        masked_embeddings = (
+            embeddings if mask is None else embeddings * mask.unsqueeze(-1).float()
+        )
+
+        return masked_embeddings @ masked_embeddings.transpose(-1, -2)
+
+    @staticmethod
+    def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+        """Numerically stable division with clamped denominator."""
+        return numerator / torch.clamp(denominator, min=PROJECTION_EPS)
+
+    @staticmethod
+    def _reconstruct_x0(
+        x_t: torch.Tensor,
+        predicted_noise: torch.Tensor,
+        sqrt_alpha: torch.Tensor,
+        sqrt_one_minus_alpha: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reconstruct clean sample x_0 from noisy x_t and predicted noise."""
+        return DiffusionTrainer._safe_divide(
+            x_t - sqrt_one_minus_alpha * predicted_noise, sqrt_alpha
+        )
 
     def p_sample(
         self,
@@ -644,9 +743,27 @@ class DiffusionTrainer:
         # Compute loss (only on valid atoms if mask provided)
         if atom_mask is not None:
             mask = atom_mask.unsqueeze(-1).float()
-            loss = F.mse_loss(predicted_noise * mask, noise * mask)
+            noise_loss = F.mse_loss(predicted_noise * mask, noise * mask)
         else:
-            loss = F.mse_loss(predicted_noise, noise)
+            noise_loss = F.mse_loss(predicted_noise, noise)
+
+        loss = noise_loss
+
+        # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
+        if self.projection_loss_weight > 0:
+            sqrt_alpha = self.sqrt_alpha_cumprod_clamped[t].view(batch_size, 1, 1)
+            sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod_clamped[t].view(
+                batch_size, 1, 1
+            )
+
+            x_0_pred = self._reconstruct_x0(
+                x_t, predicted_noise, sqrt_alpha, sqrt_one_minus_alpha
+            )
+
+            proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
+            proj_target = self.projection_from_embeddings(x_0, atom_mask)
+            proj_loss = F.mse_loss(proj_pred, proj_target)
+            loss = loss + self.projection_loss_weight * proj_loss
 
         return loss
 

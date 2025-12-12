@@ -6,6 +6,17 @@ MS spectrum to graph prediction of chemicals using Spectral Diffusion Models.
 
 Spec2Graph implements a **Spectral Diffusion Model** that learns to generate the Spectral Embedding (eigenvectors) of a molecule's Laplacian matrix, conditioned on Mass Spectrum data. This enables direct generation of high-quality spectral graph embeddings from MS spectrum data for downstream molecular reconstruction and analysis.
 
+### Why this is both clever and cursed
+
+- Eigenvectors are **sign/rotation ambiguous** (especially with degenerate eigenvalues); raw eigenvectors are unstable targets.
+- Distinct graphs can be **cospectral**, so spectral information alone is not uniquely identifying.
+- MS/MS is already ambiguous for isomers, so we stack multiple identifiability limits.
+
+**Practical fix:** train on the subspace-invariant projection matrix  
+\(P_k = V_k V_k^\top\) (first \(k\) eigenvectors) and add an orthonormality regularizer, rather than using raw eigenvectors. This is implemented via the projection-aware loss in `DiffusionTrainer` and the `projection_matrix` helper in `SpectralDataProcessor`.
+
+For a detailed implementation roadmap, see [ROADMAP.md](./ROADMAP.md).
+
 ### Key Features
 
 - **Input**: Mass spectrum peaks encoded with transformer + Fourier positional embeddings
@@ -156,6 +167,7 @@ trainer = DiffusionTrainer(
     beta_start=0.0001,
     beta_end=0.02,
     device="cuda",
+    projection_loss_weight=1.0,  # subspace-invariant P_k supervision
 )
 ```
 
