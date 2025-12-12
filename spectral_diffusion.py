@@ -580,10 +580,19 @@ class DiffusionTrainer:
             )
 
         if mask is not None:
-            embeddings = embeddings.clone()
             embeddings = embeddings * mask.unsqueeze(-1).float()
 
         return embeddings @ embeddings.transpose(-1, -2)
+
+    @staticmethod
+    def _clamp_schedule(value: torch.Tensor) -> torch.Tensor:
+        """Clamp noise schedule values to avoid divide-by-zero."""
+        return torch.clamp(value, min=PROJECTION_EPS)
+
+    @staticmethod
+    def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+        """Numerically stable division with clamped denominator."""
+        return numerator / torch.clamp(denominator, min=PROJECTION_EPS)
 
     def p_sample(
         self,
@@ -716,16 +725,16 @@ class DiffusionTrainer:
 
         # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
         if self.projection_loss_weight > 0:
-            sqrt_alpha = torch.clamp(
-                self.sqrt_alpha_cumprod[t].view(batch_size, 1, 1),
-                min=PROJECTION_EPS,
+            sqrt_alpha = self._clamp_schedule(
+                self.sqrt_alpha_cumprod[t].view(batch_size, 1, 1)
             )
-            sqrt_one_minus_alpha = torch.clamp(
-                self.sqrt_one_minus_alpha_cumprod[t].view(batch_size, 1, 1),
-                min=PROJECTION_EPS,
+            sqrt_one_minus_alpha = self._clamp_schedule(
+                self.sqrt_one_minus_alpha_cumprod[t].view(batch_size, 1, 1)
             )
 
-            x_0_pred = (x_t - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
+            x_0_pred = self._safe_divide(
+                x_t - sqrt_one_minus_alpha * predicted_noise, sqrt_alpha
+            )
 
             proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
             proj_target = self.projection_from_embeddings(x_0, atom_mask)
