@@ -13,7 +13,7 @@ This document captures the practical plan and core theory for Spec2Graph: mappin
 Do **not** train on raw eigenvectors. Train on subspace-invariant targets:
 
 \[
-P_k = V_k V_k^\top
+P_k = V_k V_k^\\top
 \]
 
 where \(V_k\) are the first \(k\) eigenvectors. \(P_k\) is invariant to sign flips and rotations within degenerate eigenspaces, making learning far less fragile. Include an orthonormality regulariser or explicit normalisation when predicting embeddings.
@@ -27,7 +27,7 @@ where \(V_k\) are the first \(k\) eigenvectors. \(P_k\) is invariant to sign fli
 **Phase 1 — Data & preprocessing**
 - Parse MSP/mzML → list of (m/z, intensity) peaks; normalise, denoise, keep top-K peaks.
 - Build a “peak graph”: nodes = peaks; edge features = Δm/z (k-NN in m/z or windowed).
-- Targets: SMILES → molecular graph via RDKit; compute Laplacian \(L\) (choose normalised/unnormalised consistently); compute \(V_k\); store \(P_k = V_k V_k^\top\) (and optionally eigenvalues).
+- Targets: SMILES → molecular graph via RDKit; compute Laplacian \(L\) (choose normalised/unnormalised consistently); compute \(V_k\); store \(P_k = V_k V_k^\\top\) (and optionally eigenvalues).
 
 **Phase 2 — Handle variable atoms**
 - Condition on formula to fix heavy-atom count \(N\) and allowed atom types. Later add a formula/adduct predictor head.

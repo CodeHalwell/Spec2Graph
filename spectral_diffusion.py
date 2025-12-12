@@ -556,10 +556,11 @@ class DiffusionTrainer:
     ) -> torch.Tensor:
         """
         Compute projection matrix P_k = E E^T for a batch of embeddings,
-        optionally masking out padded atoms. If ``mask`` is None, all atoms are
-        treated as valid. This materialises a (batch, n_atoms, n_atoms) tensor,
-        which can be memory intensive for large n_atoms; consider chunking if
-        scaling up.
+        optionally masking out padded atoms. Masked atoms are zeroed before the
+        projection is computed; the input tensor is not modified in place. If
+        ``mask`` is None, all atoms are treated as valid. This materialises a
+        (batch, n_atoms, n_atoms) tensor, which can be memory intensive for
+        large n_atoms; consider chunking if scaling up.
 
         Args:
             embeddings: Tensor of shape (batch, n_atoms, k)
@@ -709,11 +710,11 @@ class DiffusionTrainer:
                 batch_size, 1, 1
             )
 
-            x0_pred = (x_t - sqrt_one_minus_alpha * predicted_noise) / (
+            x_0_pred = (x_t - sqrt_one_minus_alpha * predicted_noise) / (
                 sqrt_alpha + PROJECTION_EPS
             )
 
-            proj_pred = self.projection_from_embeddings(x0_pred, atom_mask)
+            proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
             proj_target = self.projection_from_embeddings(x_0, atom_mask)
             proj_loss = F.mse_loss(proj_pred, proj_target)
             loss = loss + self.projection_loss_weight * proj_loss
