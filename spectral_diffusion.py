@@ -27,6 +27,8 @@ import warnings
 PROJECTION_EPS = 1e-8
 # Threshold above which projection matrices become memory-heavy (n_atoms^2)
 PROJECTION_WARNING_THRESHOLD = 256
+# Emit projection warning only once to avoid log spam during training
+PROJECTION_WARNING_EMITTED = False
 
 from rdkit import Chem
 
@@ -150,6 +152,10 @@ class SpectralDataProcessor:
 
         Returns:
             Projection matrix of shape (n_atoms, n_atoms)
+
+        Note:
+            This validates only dimensionality (2D); callers are responsible for
+            providing semantically correct (n_atoms, k) inputs.
         """
         if eigenvectors.ndim != 2:
             raise ValueError(
@@ -582,16 +588,18 @@ class DiffusionTrainer:
             Projection matrices of shape (batch, n_atoms, n_atoms)
         """
         n_atoms = embeddings.shape[1]
-        if n_atoms > PROJECTION_WARNING_THRESHOLD:
+        global PROJECTION_WARNING_EMITTED
+        if n_atoms > PROJECTION_WARNING_THRESHOLD and not PROJECTION_WARNING_EMITTED:
             warnings.warn(
                 "projection_from_embeddings materialises a (batch, n_atoms, n_atoms) tensor; "
                 f"consider chunking when n_atoms > {PROJECTION_WARNING_THRESHOLD}.",
                 RuntimeWarning,
             )
+            PROJECTION_WARNING_EMITTED = True
 
-        masked_embeddings = embeddings
-        if mask is not None:
-            masked_embeddings = embeddings * mask.unsqueeze(-1).float()
+        masked_embeddings = (
+            embeddings if mask is None else embeddings * mask.unsqueeze(-1).float()
+        )
 
         return masked_embeddings @ masked_embeddings.transpose(-1, -2)
 
@@ -599,6 +607,18 @@ class DiffusionTrainer:
     def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
         """Numerically stable division with clamped denominator."""
         return numerator / torch.clamp(denominator, min=PROJECTION_EPS)
+
+    @staticmethod
+    def _reconstruct_x0(
+        x_t: torch.Tensor,
+        predicted_noise: torch.Tensor,
+        sqrt_alpha: torch.Tensor,
+        sqrt_one_minus_alpha: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reconstruct clean sample x_0 from noisy x_t and predicted noise."""
+        return DiffusionTrainer._safe_divide(
+            x_t - sqrt_one_minus_alpha * predicted_noise, sqrt_alpha
+        )
 
     def p_sample(
         self,
@@ -736,8 +756,8 @@ class DiffusionTrainer:
                 batch_size, 1, 1
             )
 
-            x_0_pred = self._safe_divide(
-                x_t - sqrt_one_minus_alpha * predicted_noise, sqrt_alpha
+            x_0_pred = self._reconstruct_x0(
+                x_t, predicted_noise, sqrt_alpha, sqrt_one_minus_alpha
             )
 
             proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
