@@ -24,6 +24,7 @@ from typing import Tuple, Optional, Union
 import warnings
 
 PROJECTION_EPS = 1e-8
+PROJECTION_WARNING_THRESHOLD = 256
 
 from rdkit import Chem
 
@@ -571,15 +572,15 @@ class DiffusionTrainer:
             Projection matrices of shape (batch, n_atoms, n_atoms)
         """
         n_atoms = embeddings.shape[1]
-        if n_atoms > 256:
+        if n_atoms > PROJECTION_WARNING_THRESHOLD:
             warnings.warn(
                 "projection_from_embeddings materialises a (batch, n_atoms, n_atoms) tensor; "
-                "consider chunking when n_atoms is large.",
+                f"consider chunking when n_atoms > {PROJECTION_WARNING_THRESHOLD}.",
                 RuntimeWarning,
             )
 
-        embeddings = embeddings.clone()
         if mask is not None:
+            embeddings = embeddings.clone()
             embeddings = embeddings * mask.unsqueeze(-1).float()
 
         return embeddings @ embeddings.transpose(-1, -2)
@@ -719,8 +720,9 @@ class DiffusionTrainer:
                 self.sqrt_alpha_cumprod[t].view(batch_size, 1, 1),
                 min=PROJECTION_EPS,
             )
-            sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[t].view(
-                batch_size, 1, 1
+            sqrt_one_minus_alpha = torch.clamp(
+                self.sqrt_one_minus_alpha_cumprod[t].view(batch_size, 1, 1),
+                min=PROJECTION_EPS,
             )
 
             x_0_pred = (x_t - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
