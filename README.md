@@ -189,7 +189,7 @@ class SpectralKernel(nn.Module):
 K_EIGEN = 6
 operator_decoder = SpectralKernel(spectral_dim=K_EIGEN)
 
-# predicted_eigenvectors: [batch, n_atoms, K_EIGEN] from the spectral projector
+# predicted_eigenvectors: [batch, n_atoms, K_EIGEN] from the diffusion model sampling process
 bond_logits = operator_decoder(predicted_eigenvectors)  # [B, N, N]
 bond_probs = torch.sigmoid(bond_logits)
 adjacency = (bond_probs > 0.5).float()
