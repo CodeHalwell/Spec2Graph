@@ -174,6 +174,7 @@ class SpectralKernel(nn.Module):
 
 1. **Spectrum Encoder:** MS spectrum → latent vector Z  
 2. **Spectral Projector:** latent vector Z → E_hat (predicted eigenvectors)  
+   *(Note: In the code, this is implemented as a linear layer (e.g., `eigenvec_out`) within the main model, not as a separate module. "Spectral Projector" here refers to this conceptual stage.)*
 3. **Neural Operator (Decoder):** predicted eigenvectors E_hat → bond logits  
 
 #### Why this helps
