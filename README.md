@@ -113,19 +113,23 @@ print(f"Generated shape: {generated.shape}")
 
 ## Model Details
 
-## Neural Operator Decoder (Spectral Graph Neural Operator)
+### Neural Operator Decoder (Spectral Graph Neural Operator)
 
 The decoder can be implemented as a **Spectral Graph Neural Operator (SGNO)** that treats the predicted Laplacian eigenvectors as coordinates on a continuous manifold. Instead of message passing over discrete bonds, it learns a resolution-invariant kernel in the spectral domain to produce a continuous adjacency potential.
 
-### Kernel Layer (`SpectralKernel`)
+#### Kernel Layer (`SpectralKernel`)
 
 ```python
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 class SpectralKernel(nn.Module):
+    """Learnable kernel over spectral coordinates."""
     def __init__(self, spectral_dim, hidden_dim=64):
+        """
+        Args:
+            spectral_dim: Number of Laplacian eigenvectors used as coordinates.
+            hidden_dim: Hidden width for the kernel MLP.
+        """
         super().__init__()
         self.kernel_mlp = nn.Sequential(
             nn.Linear(2 * spectral_dim, hidden_dim),
@@ -133,32 +137,56 @@ class SpectralKernel(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
 
-    def forward(self, E):
-        batch_size, n_atoms, _ = E.shape
-        E_i = E.unsqueeze(2).expand(-1, -1, n_atoms, -1)
+    def forward(self, E, chunk_size=None):
+        """
+        Args:
+            E: Predicted spectral embeddings [batch, n_atoms, spectral_dim]
+            chunk_size: Optional row chunk size to reduce peak memory.
+        Returns:
+            Symmetric adjacency potential [batch, n_atoms, n_atoms]
+        """
+        _, n_atoms, _ = E.shape
         E_j = E.unsqueeze(1).expand(-1, n_atoms, -1, -1)
-        spectral_grid = torch.cat([E_i, E_j], dim=-1)
-        bond_potential = self.kernel_mlp(spectral_grid).squeeze(-1)
+
+        def eval_block(E_i_block, E_j_block):
+            spectral_grid = torch.cat([E_i_block, E_j_block], dim=-1)
+            return self.kernel_mlp(spectral_grid).squeeze(-1)
+
+        if chunk_size is None:
+            E_i = E.unsqueeze(2).expand(-1, -1, n_atoms, -1)
+            bond_potential = eval_block(E_i, E_j)
+        else:
+            blocks = []
+            for start in range(0, n_atoms, chunk_size):
+                end = min(start + chunk_size, n_atoms)
+                E_i_block = E[:, start:end, :].unsqueeze(2).expand(-1, -1, n_atoms, -1)
+                E_j_block = E_j[:, start:end, :, :]
+                blocks.append(eval_block(E_i_block, E_j_block))
+            bond_potential = torch.cat(blocks, dim=1)
         return (bond_potential + bond_potential.transpose(1, 2)) / 2
 ```
 
-### Where it fits
+> Note: The expansion builds a dense N x N grid. For large atom counts, consider chunking (compute the kernel for subsets of rows/columns and stitch the blocks) or switching to a distance-based kernel (e.g., pairwise distances from `torch.cdist`) to reduce memory.
 
-1. **Spectrum Encoder:** \(MS_{spectrum} \rightarrow Z_{latent}\)  
-2. **Spectral Projector:** \(Z_{latent} \rightarrow \hat{E}\) (predicted eigenvectors)  
-3. **Neural Operator (Decoder):** \(\hat{E} \rightarrow\) bond logits  
+#### Where it fits
 
-### Why this helps
+1. **Spectrum Encoder:** MS spectrum → latent vector Z  
+2. **Spectral Projector:** latent vector Z → E_hat (predicted eigenvectors)  
+3. **Neural Operator (Decoder):** predicted eigenvectors E_hat → bond logits  
+
+#### Why this helps
 
 - **Smoothness:** Enforces continuity in the spectral domain—spectrally close atoms receive similar connectivity.  
 - **Global context:** The kernel sees long-range structure immediately via spectral coordinates.  
 - **Resolution invariance:** Learns a connectivity function that can generalize to varying atom counts.
 
-### Quick usage
+#### Quick usage
 
 ```python
 K_EIGEN = 6
 operator_decoder = SpectralKernel(spectral_dim=K_EIGEN)
+
+# predicted_eigenvectors: [batch, n_atoms, K_EIGEN] from the spectral projector
 bond_logits = operator_decoder(predicted_eigenvectors)  # [B, N, N]
 bond_probs = torch.sigmoid(bond_logits)
 adjacency_matrix = (bond_probs > 0.5).float()
