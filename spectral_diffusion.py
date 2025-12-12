@@ -22,6 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Union
 
+PROJECTION_EPS = 1e-8
+
 from rdkit import Chem
 
 
@@ -554,7 +556,10 @@ class DiffusionTrainer:
     ) -> torch.Tensor:
         """
         Compute projection matrix P_k = E E^T for a batch of embeddings,
-        optionally masking out padded atoms.
+        optionally masking out padded atoms. If ``mask`` is None, all atoms are
+        treated as valid. This materialises a (batch, n_atoms, n_atoms) tensor,
+        which can be memory intensive for large n_atoms; consider chunking if
+        scaling up.
 
         Args:
             embeddings: Tensor of shape (batch, n_atoms, k)
@@ -705,7 +710,7 @@ class DiffusionTrainer:
             )
 
             x0_pred = (x_t - sqrt_one_minus_alpha * predicted_noise) / (
-                sqrt_alpha + 1e-8
+                sqrt_alpha + PROJECTION_EPS
             )
 
             proj_pred = self.projection_from_embeddings(x0_pred, atom_mask)
