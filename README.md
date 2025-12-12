@@ -192,7 +192,7 @@ operator_decoder = SpectralKernel(spectral_dim=K_EIGEN)
 # predicted_eigenvectors: [batch, n_atoms, K_EIGEN] from the spectral projector
 bond_logits = operator_decoder(predicted_eigenvectors)  # [B, N, N]
 bond_probs = torch.sigmoid(bond_logits)
-adjacency_matrix = (bond_probs > 0.5).float()
+adjacency = (bond_probs > 0.5).float()
 ```
 
 ### Spectral Graph Representation
