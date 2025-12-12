@@ -23,7 +23,9 @@ import torch.nn.functional as F
 from typing import Tuple, Optional, Union
 import warnings
 
+# Numerical floor to avoid divide-by-zero when reconstructing clean samples
 PROJECTION_EPS = 1e-8
+# Threshold above which projection matrices become memory-heavy (n_atoms^2)
 PROJECTION_WARNING_THRESHOLD = 256
 
 from rdkit import Chem
@@ -150,7 +152,9 @@ class SpectralDataProcessor:
             Projection matrix of shape (n_atoms, n_atoms)
         """
         if eigenvectors.ndim != 2:
-            raise ValueError("eigenvectors must be 2D (n_atoms, k)")
+            raise ValueError(
+                f"eigenvectors must be 2D (n_atoms, k), got {eigenvectors.ndim}D with shape {eigenvectors.shape}"
+            )
         return (eigenvectors @ eigenvectors.T).astype(np.float32)
 
     def process_smiles(
@@ -523,6 +527,12 @@ class DiffusionTrainer:
         # Pre-compute useful values
         self.sqrt_alpha_cumprod = torch.sqrt(self.alpha_cumprod)
         self.sqrt_one_minus_alpha_cumprod = torch.sqrt(1.0 - self.alpha_cumprod)
+        self.sqrt_alpha_cumprod_clamped = torch.clamp(
+            self.sqrt_alpha_cumprod, min=PROJECTION_EPS
+        )
+        self.sqrt_one_minus_alpha_cumprod_clamped = torch.clamp(
+            self.sqrt_one_minus_alpha_cumprod, min=PROJECTION_EPS
+        )
         self.sqrt_recip_alpha = torch.sqrt(1.0 / self.alphas)
         # Add small epsilon to denominator for numerical stability (avoids div by zero at t=0)
         self.posterior_variance = (
@@ -579,15 +589,11 @@ class DiffusionTrainer:
                 RuntimeWarning,
             )
 
+        masked_embeddings = embeddings
         if mask is not None:
-            embeddings = embeddings * mask.unsqueeze(-1).float()
+            masked_embeddings = embeddings * mask.unsqueeze(-1).float()
 
-        return embeddings @ embeddings.transpose(-1, -2)
-
-    @staticmethod
-    def _clamp_schedule(value: torch.Tensor) -> torch.Tensor:
-        """Clamp noise schedule values to avoid divide-by-zero."""
-        return torch.clamp(value, min=PROJECTION_EPS)
+        return masked_embeddings @ masked_embeddings.transpose(-1, -2)
 
     @staticmethod
     def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
@@ -725,11 +731,9 @@ class DiffusionTrainer:
 
         # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
         if self.projection_loss_weight > 0:
-            sqrt_alpha = self._clamp_schedule(
-                self.sqrt_alpha_cumprod[t].view(batch_size, 1, 1)
-            )
-            sqrt_one_minus_alpha = self._clamp_schedule(
-                self.sqrt_one_minus_alpha_cumprod[t].view(batch_size, 1, 1)
+            sqrt_alpha = self.sqrt_alpha_cumprod_clamped[t].view(batch_size, 1, 1)
+            sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod_clamped[t].view(
+                batch_size, 1, 1
             )
 
             x_0_pred = self._safe_divide(
