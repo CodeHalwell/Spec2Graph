@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Union
+import warnings
 
 PROJECTION_EPS = 1e-8
 
@@ -569,6 +570,15 @@ class DiffusionTrainer:
         Returns:
             Projection matrices of shape (batch, n_atoms, n_atoms)
         """
+        n_atoms = embeddings.shape[1]
+        if n_atoms > 256:
+            warnings.warn(
+                "projection_from_embeddings materialises a (batch, n_atoms, n_atoms) tensor; "
+                "consider chunking when n_atoms is large.",
+                RuntimeWarning,
+            )
+
+        embeddings = embeddings.clone()
         if mask is not None:
             embeddings = embeddings * mask.unsqueeze(-1).float()
 
@@ -705,14 +715,15 @@ class DiffusionTrainer:
 
         # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
         if self.projection_loss_weight > 0:
-            sqrt_alpha = self.sqrt_alpha_cumprod[t].view(batch_size, 1, 1)
+            sqrt_alpha = torch.clamp(
+                self.sqrt_alpha_cumprod[t].view(batch_size, 1, 1),
+                min=PROJECTION_EPS,
+            )
             sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[t].view(
                 batch_size, 1, 1
             )
 
-            x_0_pred = (x_t - sqrt_one_minus_alpha * predicted_noise) / (
-                sqrt_alpha + PROJECTION_EPS
-            )
+            x_0_pred = (x_t - sqrt_one_minus_alpha * predicted_noise) / sqrt_alpha
 
             proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
             proj_target = self.projection_from_embeddings(x_0, atom_mask)
