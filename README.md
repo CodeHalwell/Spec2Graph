@@ -113,6 +113,57 @@ print(f"Generated shape: {generated.shape}")
 
 ## Model Details
 
+## Neural Operator Decoder (Spectral Graph Neural Operator)
+
+The decoder can be implemented as a **Spectral Graph Neural Operator (SGNO)** that treats the predicted Laplacian eigenvectors as coordinates on a continuous manifold. Instead of message passing over discrete bonds, it learns a resolution-invariant kernel in the spectral domain to produce a continuous adjacency potential.
+
+### Kernel Layer (`SpectralKernel`)
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SpectralKernel(nn.Module):
+    def __init__(self, spectral_dim, hidden_dim=64):
+        super().__init__()
+        self.kernel_mlp = nn.Sequential(
+            nn.Linear(2 * spectral_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, E):
+        batch_size, n_atoms, _ = E.shape
+        E_i = E.unsqueeze(2).expand(-1, -1, n_atoms, -1)
+        E_j = E.unsqueeze(1).expand(-1, n_atoms, -1, -1)
+        spectral_grid = torch.cat([E_i, E_j], dim=-1)
+        bond_potential = self.kernel_mlp(spectral_grid).squeeze(-1)
+        return (bond_potential + bond_potential.transpose(1, 2)) / 2
+```
+
+### Where it fits
+
+1. **Spectrum Encoder:** \(MS_{spectrum} \rightarrow Z_{latent}\)  
+2. **Spectral Projector:** \(Z_{latent} \rightarrow \hat{E}\) (predicted eigenvectors)  
+3. **Neural Operator (Decoder):** \(\hat{E} \rightarrow\) bond logits  
+
+### Why this helps
+
+- **Smoothness:** Enforces continuity in the spectral domain—spectrally close atoms receive similar connectivity.  
+- **Global context:** The kernel sees long-range structure immediately via spectral coordinates.  
+- **Resolution invariance:** Learns a connectivity function that can generalize to varying atom counts.
+
+### Quick usage
+
+```python
+K_EIGEN = 6
+operator_decoder = SpectralKernel(spectral_dim=K_EIGEN)
+bond_logits = operator_decoder(predicted_eigenvectors)  # [B, N, N]
+bond_probs = torch.sigmoid(bond_logits)
+adjacency_matrix = (bond_probs > 0.5).float()
+```
+
 ### Spectral Graph Representation
 
 The model represents molecular graphs through their spectral embeddings:
