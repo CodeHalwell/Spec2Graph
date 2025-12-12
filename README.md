@@ -146,21 +146,22 @@ class SpectralKernel(nn.Module):
             Symmetric adjacency potential [batch, n_atoms, n_atoms]
         """
         _, n_atoms, _ = E.shape
-        E_j = E.unsqueeze(1).expand(-1, n_atoms, -1, -1)
+
 
         def eval_block(E_i_block, E_j_block):
             spectral_grid = torch.cat([E_i_block, E_j_block], dim=-1)
             return self.kernel_mlp(spectral_grid).squeeze(-1)
 
         if chunk_size is None:
-            E_i = E.unsqueeze(2).expand(-1, -1, n_atoms, -1)
+            E_i = E.unsqueeze(2).expand(-1, n_atoms, n_atoms, -1)
+            E_j = E.unsqueeze(1).expand(-1, n_atoms, n_atoms, -1)
             bond_potential = eval_block(E_i, E_j)
         else:
             blocks = []
             for start in range(0, n_atoms, chunk_size):
                 end = min(start + chunk_size, n_atoms)
-                E_i_block = E[:, start:end, :].unsqueeze(2).expand(-1, -1, n_atoms, -1)
-                E_j_block = E_j[:, start:end, :, :]
+                E_i_block = E[:, start:end, :].unsqueeze(2).expand(-1, end-start, n_atoms, -1)
+                E_j_block = E.unsqueeze(1).expand(-1, end-start, n_atoms, -1)
                 blocks.append(eval_block(E_i_block, E_j_block))
             bond_potential = torch.cat(blocks, dim=1)
         return (bond_potential + bond_potential.transpose(1, 2)) / 2
