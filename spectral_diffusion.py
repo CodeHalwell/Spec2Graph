@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 
 from rdkit import Chem
 
@@ -134,19 +134,43 @@ class SpectralDataProcessor:
 
         return selected.astype(np.float32)
 
-    def process_smiles(self, smiles: str) -> np.ndarray:
+    def projection_matrix(self, eigenvectors: np.ndarray) -> np.ndarray:
         """
-        Full pipeline: SMILES to spectral embedding.
+        Compute the spectral projection matrix P_k = V_k V_k^T to obtain a
+        subspace-invariant target (robust to sign flips and degenerate eigenspaces).
+
+        Args:
+            eigenvectors: Eigenvector matrix of shape (n_atoms, k)
+
+        Returns:
+            Projection matrix of shape (n_atoms, n_atoms)
+        """
+        if eigenvectors.ndim != 2:
+            raise ValueError("eigenvectors must be 2D (n_atoms, k)")
+        return (eigenvectors @ eigenvectors.T).astype(np.float32)
+
+    def process_smiles(
+        self, smiles: str, return_projection: bool = False
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Full pipeline: SMILES to spectral embedding (and optionally projection).
 
         Args:
             smiles: SMILES string
+            return_projection: If True, also return P_k = V_k V_k^T
 
         Returns:
-            Spectral embedding of shape (n_atoms, k)
+            Spectral embedding of shape (n_atoms, k) or a tuple
+            (eigenvectors, projection_matrix)
         """
         adjacency = self.smiles_to_adjacency(smiles)
         laplacian = self.compute_laplacian(adjacency)
         eigenvectors = self.extract_eigenvectors(laplacian)
+
+        if return_projection:
+            projection = self.projection_matrix(eigenvectors)
+            return eigenvectors, projection
+
         return eigenvectors
 
 
@@ -468,6 +492,7 @@ class DiffusionTrainer:
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
         device: str = "cpu",
+        projection_loss_weight: float = 1.0,
     ):
         """
         Initialize the diffusion trainer.
@@ -478,10 +503,12 @@ class DiffusionTrainer:
             beta_start: Starting beta value
             beta_end: Ending beta value
             device: Device to use
+            projection_loss_weight: Weight for subspace-invariant projection loss
         """
         self.model = model
         self.n_timesteps = n_timesteps
         self.device = device
+        self.projection_loss_weight = projection_loss_weight
 
         # DDPM schedule
         self.betas = torch.linspace(beta_start, beta_end, n_timesteps).to(device)
@@ -520,6 +547,26 @@ class DiffusionTrainer:
 
         x_t = sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
         return x_t, noise
+
+    @staticmethod
+    def projection_from_embeddings(
+        embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute projection matrix P_k = E E^T for a batch of embeddings,
+        optionally masking out padded atoms.
+
+        Args:
+            embeddings: Tensor of shape (batch, n_atoms, k)
+            mask: Optional boolean mask of shape (batch, n_atoms)
+
+        Returns:
+            Projection matrices of shape (batch, n_atoms, n_atoms)
+        """
+        if mask is not None:
+            embeddings = embeddings * mask.unsqueeze(-1).float()
+
+        return embeddings @ embeddings.transpose(-1, -2)
 
     def p_sample(
         self,
@@ -644,9 +691,27 @@ class DiffusionTrainer:
         # Compute loss (only on valid atoms if mask provided)
         if atom_mask is not None:
             mask = atom_mask.unsqueeze(-1).float()
-            loss = F.mse_loss(predicted_noise * mask, noise * mask)
+            noise_loss = F.mse_loss(predicted_noise * mask, noise * mask)
         else:
-            loss = F.mse_loss(predicted_noise, noise)
+            noise_loss = F.mse_loss(predicted_noise, noise)
+
+        loss = noise_loss
+
+        # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
+        if self.projection_loss_weight > 0:
+            sqrt_alpha = self.sqrt_alpha_cumprod[t].view(batch_size, 1, 1)
+            sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[t].view(
+                batch_size, 1, 1
+            )
+
+            x0_pred = (x_t - sqrt_one_minus_alpha * predicted_noise) / (
+                sqrt_alpha + 1e-8
+            )
+
+            proj_pred = self.projection_from_embeddings(x0_pred, atom_mask)
+            proj_target = self.projection_from_embeddings(x_0, atom_mask)
+            proj_loss = F.mse_loss(proj_pred, proj_target)
+            loss = loss + self.projection_loss_weight * proj_loss
 
         return loss
 
