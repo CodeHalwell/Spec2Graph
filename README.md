@@ -115,8 +115,9 @@ print(f"Generated shape: {generated.shape}")
 
 ### Neural Operator Decoder (Spectral Graph Neural Operator)
 
-The decoder can be implemented as a **Spectral Graph Neural Operator (SGNO)** that treats the predicted Laplacian eigenvectors as coordinates on a continuous manifold. Instead of message passing over discrete bonds, it learns a resolution-invariant kernel in the spectral domain to produce a continuous adjacency potential.
+> **Note:** The current implementation uses a Transformer-based decoder (see `Spec2GraphDiffusion`). The following describes a proposed alternative architecture for future enhancement.
 
+The decoder can alternatively be implemented as a **Spectral Graph Neural Operator (SGNO)** that treats the predicted Laplacian eigenvectors as coordinates on a continuous manifold. Instead of message passing over discrete bonds, it learns a resolution-invariant kernel in the spectral domain to produce a continuous adjacency potential.
 #### Kernel Layer (`SpectralKernel`)
 
 ```python
