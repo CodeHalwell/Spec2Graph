@@ -30,8 +30,16 @@ PROJECTION_WARNING_THRESHOLD = 256
 # Emit projection warning only once to avoid log spam during training
 PROJECTION_WARNING_EMITTED = False
 
-from rdkit import Chem, DataStructs
-from rdkit.Chem import AllChem
+try:
+    from rdkit import Chem, DataStructs
+    from rdkit.Chem import AllChem
+
+    _HAS_RDKIT = True
+except ImportError:  # pragma: no cover - handled at runtime with clear error
+    Chem = None
+    DataStructs = None
+    AllChem = None
+    _HAS_RDKIT = False
 
 
 class SpectralDataProcessor:
@@ -51,6 +59,13 @@ class SpectralDataProcessor:
         self.k = k
         self.bond_weighting = bond_weighting
 
+    @staticmethod
+    def _require_rdkit():
+        if not _HAS_RDKIT:
+            raise ImportError(
+                "RDKit is required for molecular processing. Please install RDKit to use SpectralDataProcessor."
+            )
+
     def smiles_to_adjacency(self, smiles: str) -> np.ndarray:
         """
         Convert a SMILES string to an adjacency matrix.
@@ -58,9 +73,10 @@ class SpectralDataProcessor:
         Args:
             smiles: SMILES representation of the molecule
 
-        Returns:
+            Returns:
             Adjacency matrix as numpy array
         """
+        self._require_rdkit()
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
@@ -133,7 +149,7 @@ class SpectralDataProcessor:
         # Skip it if the smallest eigenvalue is close to zero.
         n_atoms = laplacian.shape[0]
         eps = 1e-9
-        start_idx = int((eigenvalues < eps).sum())
+        start_idx = (eigenvalues < eps).sum()
 
         # Extract k eigenvectors starting from start_idx
         k_actual = min(self.k, n_atoms - start_idx)
@@ -184,6 +200,7 @@ class SpectralDataProcessor:
         self, smiles: str, n_bits: int = 128, radius: int = 2
     ) -> np.ndarray:
         """Compute Morgan fingerprint for a SMILES string."""
+        self._require_rdkit()
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
@@ -709,9 +726,23 @@ class DiffusionTrainer:
             embeddings if mask is None else embeddings * mask.unsqueeze(-1).float()
         )
 
-        # Proper projection matrix even when embeddings are not orthonormal
-        q, _ = torch.linalg.qr(masked_embeddings, mode="reduced")
-        proj = q @ q.transpose(-1, -2)
+        proj = torch.zeros(
+            embeddings.shape[0],
+            embeddings.shape[1],
+            embeddings.shape[1],
+            device=embeddings.device,
+            dtype=embeddings.dtype,
+        )
+        valid_batch = (
+            torch.ones(embeddings.shape[0], dtype=torch.bool, device=embeddings.device)
+            if mask is None
+            else mask.sum(dim=1) > 0
+        )
+
+        if valid_batch.any():
+            q, _ = torch.linalg.qr(masked_embeddings[valid_batch], mode="reduced")
+            proj_valid = q @ q.transpose(-1, -2)
+            proj[valid_batch] = proj_valid
 
         if mask is not None:
             mask_matrix = mask.unsqueeze(-1) * mask.unsqueeze(-2)
@@ -833,9 +864,17 @@ class DiffusionTrainer:
 
         if n_atoms is None:
             count_pred = self.model.predict_atom_count(mz, intensity, spectrum_mask)
-            n_atoms = int(
-                torch.clamp(torch.round(count_pred), 1, self.model.max_atoms)[0].item()
-            )
+            n_atoms_per_sample = torch.clamp(
+                torch.round(count_pred), 1, self.model.max_atoms
+            ).long()
+            n_atoms = int(n_atoms_per_sample.max().item())
+            if atom_mask is None:
+                atom_mask = (
+                    torch.arange(n_atoms, device=self.device)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                    < n_atoms_per_sample.unsqueeze(1)
+                )
 
         if n_atoms > self.model.max_atoms:
             raise ValueError(
@@ -1032,7 +1071,9 @@ def create_synthetic_demo_dataset(
         fingerprints.append(processor.smiles_to_fingerprint(smiles, n_bits=fingerprint_bits))
         max_atoms = max(max_atoms, eig.shape[0])
 
-        n_peaks = int(rng.integers(low=6, high=max_peaks // 2 + 2))
+        low = 6
+        high = max(low + 1, max_peaks // 2 + 2)
+        n_peaks = int(rng.integers(low=low, high=high))
         base_mass = 20 + 10 * eig.shape[0]
         mz_vals = np.sort(
             base_mass + rng.uniform(-5, 5, size=n_peaks).astype(np.float32)
@@ -1041,7 +1082,7 @@ def create_synthetic_demo_dataset(
         mz_list.append(mz_vals)
         intensity_list.append(intensities)
 
-    max_peaks_actual = max(max(len(mz_vals), 1) for mz_vals in mz_list)
+    max_peaks_actual = max(max(len(arr), 1) for arr in mz_list)
     max_peaks_final = max(max_peaks_actual, max_peaks // 2)
 
     x0 = np.zeros((batch_size, max_atoms, k), dtype=np.float32)

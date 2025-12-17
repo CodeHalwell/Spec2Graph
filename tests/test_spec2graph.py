@@ -12,8 +12,9 @@ from spectral_diffusion import (
 def test_projection_invariance_under_basis_change():
     torch.manual_seed(0)
     embeddings = torch.randn(2, 4, 3)
-    random_matrix = torch.randn(3, 3)
-    random_matrix = random_matrix + torch.eye(3)  # ensure invertible
+    u, _, v = torch.linalg.svd(torch.randn(3, 3))
+    singular_values = torch.tensor([1.0, 1.5, 2.0])
+    random_matrix = u @ torch.diag(singular_values) @ v
 
     proj_original = DiffusionTrainer.projection_from_embeddings(embeddings)
     proj_rotated = DiffusionTrainer.projection_from_embeddings(
@@ -55,7 +56,8 @@ def test_extract_eigenvectors_skips_all_zero_eigenvalues_for_disconnected_graph(
     idx = np.argsort(eigenvalues)
     eigenvalues = eigenvalues[idx]
     eigenvectors = eigenvectors[:, idx]
-    start_idx = int((eigenvalues < 1e-9).sum())
+    eigen_eps = 1e-9  # matches SpectralDataProcessor.extract_eigenvectors
+    start_idx = int((eigenvalues < eigen_eps).sum())
     expected = eigenvectors[:, start_idx : start_idx + 3]
 
     selected = processor.extract_eigenvectors(laplacian, canonicalize=False)
