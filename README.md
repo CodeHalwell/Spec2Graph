@@ -22,7 +22,7 @@ For a detailed implementation roadmap, see [ROADMAP.md](./ROADMAP.md).
 - **Input**: Mass spectrum peaks encoded with transformer + Fourier positional embeddings
 - **Output**: Top k eigenvectors of Laplacian matrix
 - **Diffusion**: DDPM formulation (noisy → denoised spectral embedding)
-- **Demo**: Includes a benzene molecule example with simulated spectrum
+- **Demo**: Synthetic padded batch with mask-aware training, projection similarity metric, and optional auxiliary heads (fingerprint + atom count)
 
 ## Architecture
 
@@ -62,10 +62,10 @@ python spectral_diffusion.py
 ```
 
 This will:
-1. Create demo data for a benzene molecule with simulated mass spectrum
-2. Build a Spec2GraphDiffusion model
-3. Train for a few iterations
-4. Generate sample eigenvectors via reverse diffusion
+1. Build a small synthetic dataset with padding masks and Morgan fingerprints
+2. Build a Spec2GraphDiffusion model (with optional fingerprint + atom-count heads)
+3. Train for a few iterations while reporting noise/projection/fingerprint/atom losses
+4. Generate sample eigenvectors via reverse diffusion and report projection similarity
 
 ### Example Code
 
@@ -109,6 +109,17 @@ print(f"Loss: {loss}")
 # Generate new eigenvectors
 generated = trainer.sample(mz, intensity, n_atoms=6)
 print(f"Generated shape: {generated.shape}")
+```
+
+### Mask conventions
+
+- `atom_mask` and `spectrum_mask` use **True = valid** entries.
+- Masks are validated at runtime (a batch item with all-False entries raises an error).
+- For padded batches, create masks based on sequence lengths:
+
+```python
+atom_mask = torch.arange(max_atoms).unsqueeze(0) < n_atoms.unsqueeze(1)  # [B, max_atoms]
+spectrum_mask = torch.arange(max_peaks).unsqueeze(0) < n_peaks.unsqueeze(1)  # [B, max_peaks]
 ```
 
 ## Model Details
