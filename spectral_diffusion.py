@@ -698,12 +698,12 @@ class DiffusionTrainer:
         embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute projection matrix P_k = E (E^T E + eps I)^{-1} E^T for a batch of
-        embeddings, optionally masking out padded atoms. Masked atoms are zeroed
-        before the projection is computed; the input tensor is not modified in
-        place. If ``mask`` is None, all atoms are treated as valid. This
-        materialises a (batch, n_atoms, n_atoms) tensor, which can be memory
-        intensive for large n_atoms; consider chunking if scaling up.
+        Compute projection matrix P_k = Q Q^T using a QR-orthonormalised basis of
+        the embedding columns. Masked atoms are zeroed before the projection is
+        computed; the input tensor is not modified in place. If ``mask`` is None,
+        all atoms are treated as valid. This materialises a (batch, n_atoms,
+        n_atoms) tensor, which can be memory intensive for large n_atoms; consider
+        chunking if scaling up.
 
         Args:
             embeddings: Tensor of shape (batch, n_atoms, k)
@@ -855,6 +855,10 @@ class DiffusionTrainer:
             n_atoms: Number of atoms to generate (if None, predicted from spectrum)
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
+            
+        Note:
+            When ``n_atoms`` is None, this relies on a trained atom-count head
+            (`enable_atom_count_head=True`) to provide reasonable predictions.
 
         Returns:
             Generated eigenvectors, shape (batch, n_atoms, k)
