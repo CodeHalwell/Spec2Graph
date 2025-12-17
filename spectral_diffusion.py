@@ -30,20 +30,26 @@ PROJECTION_WARNING_THRESHOLD = 256
 # Emit projection warning only once to avoid log spam during training
 PROJECTION_WARNING_EMITTED = False
 
-from rdkit import Chem
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem
 
 
 class SpectralDataProcessor:
     """Processes molecular SMILES to spectral graph representations."""
 
-    def __init__(self, k: int = 8):
+    def __init__(self, k: int = 8, bond_weighting: str = "order"):
         """
         Initialize the spectral data processor.
 
         Args:
             k: Number of top eigenvectors to extract
+            bond_weighting: How to weight bonds when building the adjacency.
+                - "unweighted": all bonds weight 1.0
+                - "order": use bond order (single=1, double=2, triple=3, aromatic=1.5)
+                - "aromatic": aromatic=1.5, else 1.0
         """
         self.k = k
+        self.bond_weighting = bond_weighting
 
     def smiles_to_adjacency(self, smiles: str) -> np.ndarray:
         """
@@ -65,8 +71,19 @@ class SpectralDataProcessor:
         for bond in mol.GetBonds():
             i = bond.GetBeginAtomIdx()
             j = bond.GetEndAtomIdx()
-            adjacency[i, j] = 1.0
-            adjacency[j, i] = 1.0
+            if self.bond_weighting == "unweighted":
+                weight = 1.0
+            elif self.bond_weighting == "order":
+                weight = float(bond.GetBondTypeAsDouble())
+            elif self.bond_weighting == "aromatic":
+                weight = 1.5 if bond.GetIsAromatic() else 1.0
+            else:
+                raise ValueError(
+                    f"Unsupported bond_weighting='{self.bond_weighting}'. "
+                    "Choose from ['unweighted', 'order', 'aromatic']."
+                )
+            adjacency[i, j] = weight
+            adjacency[j, i] = weight
 
         return adjacency
 
@@ -116,7 +133,7 @@ class SpectralDataProcessor:
         # Skip it if the smallest eigenvalue is close to zero.
         n_atoms = laplacian.shape[0]
         eps = 1e-9
-        start_idx = 1 if eigenvalues[0] < eps else 0
+        start_idx = int((eigenvalues < eps).sum())
 
         # Extract k eigenvectors starting from start_idx
         k_actual = min(self.k, n_atoms - start_idx)
@@ -162,6 +179,18 @@ class SpectralDataProcessor:
                 f"eigenvectors must be 2D (n_atoms, k), got {eigenvectors.ndim}D with shape {eigenvectors.shape}"
             )
         return (eigenvectors @ eigenvectors.T).astype(np.float32)
+
+    def smiles_to_fingerprint(
+        self, smiles: str, n_bits: int = 128, radius: int = 2
+    ) -> np.ndarray:
+        """Compute Morgan fingerprint for a SMILES string."""
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"Invalid SMILES: {smiles}")
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+        arr = np.zeros((n_bits,), dtype=np.float32)
+        DataStructs.ConvertToNumpyArray(fp, arr)
+        return arr
 
     def process_smiles(
         self, smiles: str, return_projection: bool = False
@@ -330,6 +359,8 @@ class Spec2GraphDiffusion(nn.Module):
         max_atoms: int = 64,
         max_peaks: int = 100,
         dropout: float = 0.1,
+        fingerprint_dim: int = 0,
+        enable_atom_count_head: bool = False,
     ):
         """
         Initialize the Spec2Graph diffusion model.
@@ -344,6 +375,8 @@ class Spec2GraphDiffusion(nn.Module):
             max_atoms: Maximum number of atoms
             max_peaks: Maximum number of spectrum peaks
             dropout: Dropout rate
+            fingerprint_dim: Optional size of fingerprint prediction head (0 to disable)
+            enable_atom_count_head: Whether to add an atom-count prediction head for sampling
         """
         super().__init__()
 
@@ -394,6 +427,35 @@ class Spec2GraphDiffusion(nn.Module):
         self.encoder_norm = nn.LayerNorm(d_model)
         self.decoder_norm = nn.LayerNorm(d_model)
 
+        # Optional auxiliary heads
+        if fingerprint_dim > 0:
+            self.fingerprint_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, fingerprint_dim),
+            )
+        else:
+            self.fingerprint_head = None
+
+        if enable_atom_count_head:
+            self.atom_count_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, 1),
+            )
+        else:
+            self.atom_count_head = None
+
+    @staticmethod
+    def _validate_mask(mask: torch.Tensor, name: str) -> None:
+        """Ensure masks follow the True=valid convention and have at least one valid token."""
+        if mask.dtype != torch.bool:
+            raise ValueError(f"{name} must be a boolean tensor with True indicating valid entries.")
+        if mask.dim() < 2:
+            raise ValueError(f"{name} must have shape (batch, length); got {mask.shape}.")
+        if torch.any(mask.sum(dim=1) == 0):
+            raise ValueError(f"{name} must contain at least one valid element per batch item.")
+
     def encode_spectrum(
         self,
         mz: torch.Tensor,
@@ -406,7 +468,7 @@ class Spec2GraphDiffusion(nn.Module):
         Args:
             mz: m/z values, shape (batch, n_peaks)
             intensity: Intensity values, shape (batch, n_peaks)
-            mask: Optional mask for padding, shape (batch, n_peaks)
+            mask: Optional boolean mask for padding (True = valid), shape (batch, n_peaks)
 
         Returns:
             Encoded spectrum, shape (batch, n_peaks, d_model)
@@ -418,6 +480,7 @@ class Spec2GraphDiffusion(nn.Module):
 
         # Apply transformer encoder
         if mask is not None:
+            self._validate_mask(mask, "spectrum_mask")
             # Convert to attention mask format (True = ignore)
             src_key_padding_mask = ~mask
         else:
@@ -445,13 +508,19 @@ class Spec2GraphDiffusion(nn.Module):
             t: Timesteps, shape (batch,)
             mz: m/z values, shape (batch, n_peaks)
             intensity: Intensity values, shape (batch, n_peaks)
-            atom_mask: Mask for valid atoms, shape (batch, n_atoms)
-            spectrum_mask: Mask for valid peaks, shape (batch, n_peaks)
+            atom_mask: Boolean mask for valid atoms (True = valid), shape (batch, n_atoms)
+            spectrum_mask: Boolean mask for valid peaks (True = valid), shape (batch, n_peaks)
 
         Returns:
             Predicted noise, shape (batch, n_atoms, k)
         """
         batch_size, n_atoms, _ = x_t.shape
+
+        if n_atoms > self.max_atoms:
+            raise ValueError(
+                f"Number of atoms ({n_atoms}) exceeds configured max_atoms ({self.max_atoms}). "
+                "Increase max_atoms or truncate input."
+            )
 
         # Encode spectrum
         memory = self.encode_spectrum(mz, intensity, spectrum_mask)
@@ -472,6 +541,7 @@ class Spec2GraphDiffusion(nn.Module):
 
         # Prepare masks
         if atom_mask is not None:
+            self._validate_mask(atom_mask, "atom_mask")
             tgt_key_padding_mask = ~atom_mask
         else:
             tgt_key_padding_mask = None
@@ -495,6 +565,38 @@ class Spec2GraphDiffusion(nn.Module):
 
         return output
 
+    def _pool_spectrum(
+        self, encoded: torch.Tensor, spectrum_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Mean-pool spectrum embeddings respecting padding mask."""
+        if spectrum_mask is None:
+            return encoded.mean(dim=1)
+        spectrum_mask = spectrum_mask.float().unsqueeze(-1)
+        denom = torch.clamp(spectrum_mask.sum(dim=1), min=PROJECTION_EPS)
+        return (encoded * spectrum_mask).sum(dim=1) / denom
+
+    def predict_fingerprint(
+        self, mz: torch.Tensor, intensity: torch.Tensor, spectrum_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Predict fingerprint logits from spectrum input."""
+        if self.fingerprint_head is None:
+            raise ValueError("Fingerprint head is disabled. Set fingerprint_dim>0 to enable.")
+        encoded = self.encode_spectrum(mz, intensity, spectrum_mask)
+        pooled = self._pool_spectrum(encoded, spectrum_mask)
+        return self.fingerprint_head(pooled)
+
+    def predict_atom_count(
+        self, mz: torch.Tensor, intensity: torch.Tensor, spectrum_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Predict atom count (regression logit) from spectrum input."""
+        if self.atom_count_head is None:
+            raise ValueError(
+                "Atom count head is disabled. Set enable_atom_count_head=True to enable predictions."
+            )
+        encoded = self.encode_spectrum(mz, intensity, spectrum_mask)
+        pooled = self._pool_spectrum(encoded, spectrum_mask)
+        return self.atom_count_head(pooled).squeeze(-1)
+
 
 class DiffusionTrainer:
     """Training and sampling utilities for DDPM diffusion."""
@@ -507,6 +609,8 @@ class DiffusionTrainer:
         beta_end: float = 0.02,
         device: str = "cpu",
         projection_loss_weight: float = 1.0,
+        fingerprint_loss_weight: float = 0.0,
+        atom_count_loss_weight: float = 0.0,
     ):
         """
         Initialize the diffusion trainer.
@@ -518,11 +622,15 @@ class DiffusionTrainer:
             beta_end: Ending beta value
             device: Device to use
             projection_loss_weight: Weight for subspace-invariant projection loss
+            fingerprint_loss_weight: Weight for optional fingerprint auxiliary loss
+            atom_count_loss_weight: Weight for optional atom-count auxiliary loss
         """
         self.model = model
         self.n_timesteps = n_timesteps
         self.device = device
         self.projection_loss_weight = projection_loss_weight
+        self.fingerprint_loss_weight = fingerprint_loss_weight
+        self.atom_count_loss_weight = atom_count_loss_weight
 
         # DDPM schedule
         self.betas = torch.linspace(beta_start, beta_end, n_timesteps).to(device)
@@ -573,12 +681,12 @@ class DiffusionTrainer:
         embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute projection matrix P_k = E E^T for a batch of embeddings,
-        optionally masking out padded atoms. Masked atoms are zeroed before the
-        projection is computed; the input tensor is not modified in place. If
-        ``mask`` is None, all atoms are treated as valid. This materialises a
-        (batch, n_atoms, n_atoms) tensor, which can be memory intensive for
-        large n_atoms; consider chunking if scaling up.
+        Compute projection matrix P_k = E (E^T E + eps I)^{-1} E^T for a batch of
+        embeddings, optionally masking out padded atoms. Masked atoms are zeroed
+        before the projection is computed; the input tensor is not modified in
+        place. If ``mask`` is None, all atoms are treated as valid. This
+        materialises a (batch, n_atoms, n_atoms) tensor, which can be memory
+        intensive for large n_atoms; consider chunking if scaling up.
 
         Args:
             embeddings: Tensor of shape (batch, n_atoms, k)
@@ -601,12 +709,39 @@ class DiffusionTrainer:
             embeddings if mask is None else embeddings * mask.unsqueeze(-1).float()
         )
 
-        return masked_embeddings @ masked_embeddings.transpose(-1, -2)
+        # Proper projection matrix even when embeddings are not orthonormal
+        q, _ = torch.linalg.qr(masked_embeddings, mode="reduced")
+        proj = q @ q.transpose(-1, -2)
+
+        if mask is not None:
+            mask_matrix = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+            proj = proj * mask_matrix.float()
+
+        # Enforce symmetry to reduce numerical drift
+        proj = 0.5 * (proj + proj.transpose(-1, -2))
+
+        return proj
 
     @staticmethod
     def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
         """Numerically stable division with clamped denominator."""
         return numerator / torch.clamp(denominator, min=PROJECTION_EPS)
+
+    @staticmethod
+    def _masked_mse(
+        pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Mask-aware MSE normalised by the number of valid entries."""
+        if mask is None:
+            return F.mse_loss(pred, target)
+
+        while mask.dim() < pred.dim():
+            mask = mask.unsqueeze(-1)
+        mask = mask.float()
+        diff = (pred - target) ** 2
+        per_item = (diff * mask).view(diff.shape[0], -1).sum(dim=1)
+        denom = mask.view(mask.shape[0], -1).sum(dim=1).clamp_min(PROJECTION_EPS)
+        return (per_item / denom).mean()
 
     @staticmethod
     def _reconstruct_x0(
@@ -676,7 +811,7 @@ class DiffusionTrainer:
         self,
         mz: torch.Tensor,
         intensity: torch.Tensor,
-        n_atoms: int,
+        n_atoms: Optional[int] = None,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -686,7 +821,7 @@ class DiffusionTrainer:
         Args:
             mz: m/z values, shape (batch, n_peaks)
             intensity: Intensity values, shape (batch, n_peaks)
-            n_atoms: Number of atoms to generate
+            n_atoms: Number of atoms to generate (if None, predicted from spectrum)
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
 
@@ -695,6 +830,17 @@ class DiffusionTrainer:
         """
         batch_size = mz.shape[0]
         k = self.model.k
+
+        if n_atoms is None:
+            count_pred = self.model.predict_atom_count(mz, intensity, spectrum_mask)
+            n_atoms = int(
+                torch.clamp(torch.round(count_pred), 1, self.model.max_atoms)[0].item()
+            )
+
+        if n_atoms > self.model.max_atoms:
+            raise ValueError(
+                f"Requested n_atoms ({n_atoms}) exceeds model.max_atoms ({self.model.max_atoms})."
+            )
 
         # Start from pure noise
         x_t = torch.randn(batch_size, n_atoms, k, device=self.device)
@@ -712,7 +858,10 @@ class DiffusionTrainer:
         intensity: torch.Tensor,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        fingerprint_targets: Optional[torch.Tensor] = None,
+        atom_count_targets: Optional[torch.Tensor] = None,
+        return_components: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         """
         Compute training loss.
 
@@ -722,6 +871,9 @@ class DiffusionTrainer:
             intensity: Intensity values, shape (batch, n_peaks)
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
+            fingerprint_targets: Optional fingerprint labels for auxiliary loss
+            atom_count_targets: Optional atom-count labels for auxiliary loss
+            return_components: If True, also return component losses
 
         Returns:
             MSE loss
@@ -741,13 +893,14 @@ class DiffusionTrainer:
         )
 
         # Compute loss (only on valid atoms if mask provided)
-        if atom_mask is not None:
-            mask = atom_mask.unsqueeze(-1).float()
-            noise_loss = F.mse_loss(predicted_noise * mask, noise * mask)
-        else:
-            noise_loss = F.mse_loss(predicted_noise, noise)
+        noise_loss = self._masked_mse(
+            predicted_noise, noise, mask=atom_mask.unsqueeze(-1) if atom_mask is not None else None
+        )
 
         loss = noise_loss
+        proj_loss = torch.tensor(0.0, device=self.device)
+        fingerprint_loss = torch.tensor(0.0, device=self.device)
+        atom_count_loss = torch.tensor(0.0, device=self.device)
 
         # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
         if self.projection_loss_weight > 0:
@@ -762,8 +915,29 @@ class DiffusionTrainer:
 
             proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
             proj_target = self.projection_from_embeddings(x_0, atom_mask)
-            proj_loss = F.mse_loss(proj_pred, proj_target)
+            mask_matrix = (
+                None if atom_mask is None else atom_mask.unsqueeze(-1) * atom_mask.unsqueeze(-2)
+            )
+            proj_loss = self._masked_mse(proj_pred, proj_target, mask=mask_matrix)
             loss = loss + self.projection_loss_weight * proj_loss
+
+        if self.fingerprint_loss_weight > 0 and fingerprint_targets is not None:
+            fp_logits = self.model.predict_fingerprint(mz, intensity, spectrum_mask)
+            fingerprint_loss = F.binary_cross_entropy_with_logits(fp_logits, fingerprint_targets)
+            loss = loss + self.fingerprint_loss_weight * fingerprint_loss
+
+        if self.atom_count_loss_weight > 0 and atom_count_targets is not None:
+            atom_pred = self.model.predict_atom_count(mz, intensity, spectrum_mask)
+            atom_count_loss = F.mse_loss(atom_pred, atom_count_targets.float())
+            loss = loss + self.atom_count_loss_weight * atom_count_loss
+
+        if return_components:
+            return loss, {
+                "noise": noise_loss.detach(),
+                "projection": proj_loss.detach(),
+                "fingerprint": fingerprint_loss.detach(),
+                "atom_count": atom_count_loss.detach(),
+            }
 
         return loss
 
@@ -775,7 +949,10 @@ class DiffusionTrainer:
         intensity: torch.Tensor,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
-    ) -> float:
+        fingerprint_targets: Optional[torch.Tensor] = None,
+        atom_count_targets: Optional[torch.Tensor] = None,
+        return_components: bool = False,
+    ) -> Union[float, Tuple[float, dict]]:
         """
         Single training step.
 
@@ -786,6 +963,9 @@ class DiffusionTrainer:
             intensity: Intensity values
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
+            fingerprint_targets: Optional fingerprint labels
+            atom_count_targets: Optional atom-count labels
+            return_components: If True, also return component losses
 
         Returns:
             Loss value
@@ -793,32 +973,104 @@ class DiffusionTrainer:
         self.model.train()
         optimizer.zero_grad()
 
-        loss = self.compute_loss(x_0, mz, intensity, atom_mask, spectrum_mask)
+        loss, components = (
+            self.compute_loss(
+                x_0,
+                mz,
+                intensity,
+                atom_mask,
+                spectrum_mask,
+                fingerprint_targets,
+                atom_count_targets,
+                return_components=True,
+            )
+            if return_components
+            else (self.compute_loss(x_0, mz, intensity, atom_mask, spectrum_mask), None)
+        )
         loss.backward()
         optimizer.step()
+
+        if return_components:
+            return loss.item(), {k: v.item() for k, v in components.items()}
 
         return loss.item()
 
 
-def create_benzene_demo_data() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def create_synthetic_demo_dataset(
+    batch_size: int = 32, k: int = 8, max_peaks: int = 40, fingerprint_bits: int = 128
+) -> Tuple[torch.Tensor, ...]:
     """
-    Create demo data for benzene molecule with simulated spectrum.
-
+    Create a small synthetic dataset with padding, masks, and fingerprints.
+ 
     Returns:
-        Tuple of (eigenvectors, mz_values, intensities)
+        Tuple of (eigenvectors, mz_values, intensities, atom_mask, spectrum_mask, fingerprints, atom_counts)
     """
-    # Process benzene SMILES
-    processor = SpectralDataProcessor(k=8)
-    smiles = "c1ccccc1"  # Benzene
+    rng = np.random.default_rng(0)
+    smiles_pool = [
+        "c1ccccc1",  # benzene
+        "CCO",  # ethanol
+        "CC(=O)O",  # acetic acid
+        "C#N",  # hydrogen cyanide
+        "CCN",  # ethylamine
+        "CCCC",  # butane
+        "C1=CC=CN=C1",  # pyridine
+    ]
+    processor = SpectralDataProcessor(k=k, bond_weighting="order")
 
-    eigenvectors = processor.process_smiles(smiles)
+    eigen_list = []
+    mz_list = []
+    intensity_list = []
+    atom_counts = []
+    fingerprints = []
 
-    # Simulated mass spectrum for benzene (MW ~78)
-    # Major peaks: molecular ion (78), loss of H (77), C4H3 (51), C3H3 (39) -- common fragmentation patterns for benzene in mass spectrometry (m/z values in parentheses)
-    mz_values = np.array([39.0, 50.0, 51.0, 52.0, 63.0, 74.0, 76.0, 77.0, 78.0, 79.0])
-    intensities = np.array([0.3, 0.1, 0.4, 0.15, 0.1, 0.05, 0.2, 0.6, 1.0, 0.1])
+    max_atoms = 0
+    for i in range(batch_size):
+        smiles = smiles_pool[i % len(smiles_pool)]
+        eig = processor.process_smiles(smiles)
+        eigen_list.append(eig)
+        atom_counts.append(eig.shape[0])
+        fingerprints.append(processor.smiles_to_fingerprint(smiles, n_bits=fingerprint_bits))
+        max_atoms = max(max_atoms, eig.shape[0])
 
-    return eigenvectors, mz_values, intensities
+        n_peaks = int(rng.integers(low=6, high=max_peaks // 2 + 2))
+        base_mass = 20 + 10 * eig.shape[0]
+        mz_vals = np.sort(
+            base_mass + rng.uniform(-5, 5, size=n_peaks).astype(np.float32)
+        ).astype(np.float32)
+        intensities = rng.random(n_peaks).astype(np.float32)
+        mz_list.append(mz_vals)
+        intensity_list.append(intensities)
+
+    max_peaks_actual = max(max(len(mz_vals), 1) for mz_vals in mz_list)
+    max_peaks_final = max(max_peaks_actual, max_peaks // 2)
+
+    x0 = np.zeros((batch_size, max_atoms, k), dtype=np.float32)
+    atom_mask = np.zeros((batch_size, max_atoms), dtype=bool)
+    mz = np.zeros((batch_size, max_peaks_final), dtype=np.float32)
+    intensity = np.zeros((batch_size, max_peaks_final), dtype=np.float32)
+    spectrum_mask = np.zeros((batch_size, max_peaks_final), dtype=bool)
+    fp_arr = np.zeros((batch_size, fingerprint_bits), dtype=np.float32)
+
+    for i in range(batch_size):
+        n_atoms = eigen_list[i].shape[0]
+        x0[i, :n_atoms, :] = eigen_list[i]
+        atom_mask[i, :n_atoms] = True
+
+        n_peaks = len(mz_list[i])
+        mz[i, :n_peaks] = mz_list[i]
+        intensity[i, :n_peaks] = intensity_list[i]
+        spectrum_mask[i, :n_peaks] = True
+        fp_arr[i] = fingerprints[i]
+
+    return (
+        torch.tensor(x0, dtype=torch.float32),
+        torch.tensor(mz, dtype=torch.float32),
+        torch.tensor(intensity, dtype=torch.float32),
+        torch.tensor(atom_mask),
+        torch.tensor(spectrum_mask),
+        torch.tensor(fp_arr, dtype=torch.float32),
+        torch.tensor(atom_counts, dtype=torch.float32),
+    )
 
 
 def run_demo():
@@ -832,15 +1084,31 @@ def run_demo():
     print(f"\nUsing device: {device}")
 
     # Create demo data
-    print("\n1. Creating demo data for benzene molecule...")
-    eigenvectors, mz_values, intensities = create_benzene_demo_data()
-    print(f"   Eigenvector shape: {eigenvectors.shape}")
-    print(f"   Number of spectrum peaks: {len(mz_values)}")
-
-    # Convert to tensors
-    x_0 = torch.tensor(eigenvectors, dtype=torch.float32).unsqueeze(0).to(device)
-    mz = torch.tensor(mz_values, dtype=torch.float32).unsqueeze(0).to(device)
-    intensity = torch.tensor(intensities, dtype=torch.float32).unsqueeze(0).to(device)
+    print("\n1. Creating synthetic demo dataset with padding and masks...")
+    (
+        x_0,
+        mz,
+        intensity,
+        atom_mask,
+        spectrum_mask,
+        fp_targets,
+        atom_counts,
+    ) = create_synthetic_demo_dataset(batch_size=32, k=8, max_peaks=40, fingerprint_bits=128)
+    x_0, mz, intensity, atom_mask, spectrum_mask, fp_targets, atom_counts = (
+        x_0.to(device),
+        mz.to(device),
+        intensity.to(device),
+        atom_mask.to(device),
+        spectrum_mask.to(device),
+        fp_targets.to(device),
+        atom_counts.to(device),
+    )
+    print(f"   Eigenvector batch shape (with padding): {x_0.shape}")
+    print(f"   Spectrum batch shape (with padding): {mz.shape}")
+    print(f"   Example atom_mask valid atoms: {int(atom_mask[0].sum().item())}/{atom_mask.shape[1]}")
+    print(
+        f"   Example spectrum_mask valid peaks: {int(spectrum_mask[0].sum().item())}/{spectrum_mask.shape[1]}"
+    )
 
     # Create model
     print("\n2. Creating Spec2GraphDiffusion model...")
@@ -850,10 +1118,12 @@ def run_demo():
         num_encoder_layers=2,
         num_decoder_layers=2,
         dim_feedforward=512,
-        k=8,
-        max_atoms=32,
-        max_peaks=50,
+        k=x_0.shape[-1],
+        max_atoms=x_0.shape[1],
+        max_peaks=mz.shape[1],
         dropout=0.1,
+        fingerprint_dim=fp_targets.shape[-1],
+        enable_atom_count_head=True,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -865,33 +1135,49 @@ def run_demo():
         model=model,
         n_timesteps=100,  # Reduced for demo
         device=device,
+        projection_loss_weight=1.0,
+        fingerprint_loss_weight=0.1,
+        atom_count_loss_weight=0.05,
     )
 
     # Training loop
-    print("\n4. Training for a few steps (demo only)...")
+    print("\n4. Training for a few steps on the padded batch (demo only)...")
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    n_steps = 50
+    n_steps = 20
     for step in range(n_steps):
-        loss = trainer.train_step(optimizer, x_0, mz, intensity)
-        if (step + 1) % 10 == 0:
-            print(f"   Step {step + 1}/{n_steps}, Loss: {loss:.4f}")
+        loss, components = trainer.train_step(
+            optimizer,
+            x_0,
+            mz,
+            intensity,
+            atom_mask=atom_mask,
+            spectrum_mask=spectrum_mask,
+            fingerprint_targets=fp_targets,
+            atom_count_targets=atom_counts,
+            return_components=True,
+        )
+        if (step + 1) % 5 == 0:
+            print(
+                f"   Step {step + 1}/{n_steps}, total loss: {loss:.4f} | "
+                f"noise: {components['noise']:.4f}, proj: {components['projection']:.4f}, "
+                f"fp: {components['fingerprint']:.4f}, atoms: {components['atom_count']:.4f}"
+            )
 
     # Sample
     print("\n5. Generating sample eigenvectors...")
     model.eval()
-    n_atoms = eigenvectors.shape[0]
-    generated = trainer.sample(mz, intensity, n_atoms)
+    generated = trainer.sample(
+        mz[:1], intensity[:1], n_atoms=None, spectrum_mask=spectrum_mask[:1]
+    )
+    target_proj = DiffusionTrainer.projection_from_embeddings(
+        x_0[:1], mask=atom_mask[:1]
+    ).cpu()
+    gen_proj = DiffusionTrainer.projection_from_embeddings(generated.cpu()).cpu()
+    projection_similarity = F.mse_loss(gen_proj, target_proj).item()
 
     print(f"   Generated shape: {generated.shape}")
-    print(f"   Original eigenvectors (first atom):\n   {eigenvectors[0, :]}")
-    print(f"   Generated eigenvectors (first atom):\n   {generated[0, 0, :].cpu().numpy()}")
-
-    # Compute similarity
-    orig_flat = torch.tensor(eigenvectors).flatten()
-    gen_flat = generated[0].cpu().flatten()
-    cosine_sim = F.cosine_similarity(orig_flat.unsqueeze(0), gen_flat.unsqueeze(0))
-    print(f"\n   Cosine similarity (original vs generated): {cosine_sim.item():.4f}")
+    print(f"   Projection similarity (lower is better): {projection_similarity:.4f}")
 
     print("\n" + "=" * 60)
     print("Demo complete!")
