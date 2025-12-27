@@ -1230,7 +1230,7 @@ def run_demo():
     target_proj = DiffusionTrainer.projection_from_embeddings(
         x_0[:1], mask=atom_mask[:1]
     ).cpu()
-    gen_proj = DiffusionTrainer.projection_from_embeddings(generated.cpu()).cpu()
+    gen_proj = DiffusionTrainer.projection_from_embeddings(generated.cpu())
     projection_similarity = F.mse_loss(gen_proj, target_proj).item()
 
     print(f"   Generated shape: {generated.shape}")
