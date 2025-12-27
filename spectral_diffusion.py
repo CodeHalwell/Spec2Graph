@@ -1028,7 +1028,19 @@ class DiffusionTrainer:
                 return_components=True,
             )
             if return_components
-            else (self.compute_loss(x_0, mz, intensity, atom_mask, spectrum_mask), None)
+            else (
+                self.compute_loss(
+                    x_0,
+                    mz,
+                    intensity,
+                    atom_mask,
+                    spectrum_mask,
+                    fingerprint_targets,
+                    atom_count_targets,
+                    return_components=False,
+                ),
+                None,
+            )
         )
         loss.backward()
         optimizer.step()
