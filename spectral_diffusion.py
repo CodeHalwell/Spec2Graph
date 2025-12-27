@@ -73,7 +73,7 @@ class SpectralDataProcessor:
         Args:
             smiles: SMILES representation of the molecule
 
-            Returns:
+        Returns:
             Adjacency matrix as numpy array
         """
         self._require_rdkit()
