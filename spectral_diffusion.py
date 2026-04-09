@@ -1105,6 +1105,7 @@ class DiffusionTrainer:
         spectrum_mask: Optional[torch.Tensor] = None,
         fingerprint_targets: Optional[torch.Tensor] = None,
         atom_count_targets: Optional[torch.Tensor] = None,
+        eigenvalue_targets: Optional[torch.Tensor] = None,
         return_components: bool = False,
     ) -> Union[float, Tuple[float, dict]]:
         """
@@ -1119,6 +1120,7 @@ class DiffusionTrainer:
             spectrum_mask: Optional spectrum mask
             fingerprint_targets: Optional fingerprint labels
             atom_count_targets: Optional atom-count labels
+            eigenvalue_targets: Optional eigenvalue labels for Phase 4 loss
             return_components: If True, also return component losses
 
         Returns:
@@ -1136,6 +1138,7 @@ class DiffusionTrainer:
                 spectrum_mask,
                 fingerprint_targets,
                 atom_count_targets,
+                eigenvalue_targets,
                 return_components=True,
             )
             if return_components
@@ -1148,6 +1151,7 @@ class DiffusionTrainer:
                     spectrum_mask,
                     fingerprint_targets,
                     atom_count_targets,
+                    eigenvalue_targets,
                     return_components=False,
                 ),
                 None,
@@ -1191,7 +1195,7 @@ class SpectralGraphNeuralOperator(nn.Module):
         layers: List[nn.Module] = []
         in_dim = 2 * k  # concatenation of two node embeddings
         for i in range(num_layers - 1):
-            out_dim = hidden_dim if i < num_layers - 2 else hidden_dim
+            out_dim = hidden_dim
             layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU()])
             in_dim = out_dim
         layers.append(nn.Linear(in_dim, 1))
@@ -1286,7 +1290,7 @@ class DenseGNNLayer(nn.Module):
         """
         # Degree normalisation: D^{-1/2} A D^{-1/2}
         degree = adj.sum(dim=-1, keepdim=True).clamp(min=PROJECTION_EPS)
-        degree_inv_sqrt = 1.0 / torch.sqrt(degree)
+        degree_inv_sqrt = torch.rsqrt(degree)
         # Normalised message passing
         adj_norm = adj * degree_inv_sqrt * degree_inv_sqrt.transpose(-1, -2)
         # Aggregate messages
@@ -1443,7 +1447,9 @@ class GuidedDiffusionSampler:
                 eps_for_tweedie = self.trainer.model(
                     x_t_grad, t_tensor, mz, intensity, atom_mask, spectrum_mask
                 )
-                x0_hat = (x_t_grad - sqrt_one_minus * eps_for_tweedie) / sqrt_alpha_bar.clamp(min=PROJECTION_EPS)
+                x0_hat = DiffusionTrainer._safe_divide(
+                    x_t_grad - sqrt_one_minus * eps_for_tweedie, sqrt_alpha_bar
+                )
 
                 # Decode to adjacency and score validity
                 adj_probs = self.sgno.bond_probabilities(x0_hat)

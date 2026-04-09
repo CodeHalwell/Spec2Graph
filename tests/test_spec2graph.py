@@ -630,10 +630,12 @@ class TestEndToEndPipeline:
         loss_val, components = trainer.train_step(
             optimizer, x_0, mz, intensity,
             fingerprint_targets=fp, atom_count_targets=ac,
+            eigenvalue_targets=ev,
             return_components=True
         )
         assert isinstance(loss_val, float)
         assert loss_val > 0
         assert all(k in components for k in [
-            "noise", "projection", "orthonormality", "fingerprint", "atom_count"
+            "noise", "projection", "orthonormality", "fingerprint", "atom_count",
+            "eigenvalue"
         ])
