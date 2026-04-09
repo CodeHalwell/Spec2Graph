@@ -316,6 +316,10 @@ class TestPrecursorConditioning:
                 x_0, mz, intensity, precursor_mz=torch.tensor([500.0])
             )
 
+        assert torch.isfinite(loss_low)
+        assert torch.isfinite(loss_high)
+        assert loss_low.item() >= 0
+        assert loss_high.item() >= 0
         assert not torch.allclose(loss_low, loss_high)
 
     def test_sample_changes_with_precursor_conditioning(self):
@@ -339,6 +343,10 @@ class TestPrecursorConditioning:
             mz, intensity, n_atoms=4, precursor_mz=torch.tensor([500.0])
         )
 
+        assert sample_low.shape == (1, 4, 2)
+        assert sample_high.shape == (1, 4, 2)
+        assert torch.all(torch.isfinite(sample_low))
+        assert torch.all(torch.isfinite(sample_high))
         assert not torch.allclose(sample_low, sample_high)
 
 
