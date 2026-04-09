@@ -10,6 +10,11 @@ Key Components:
 - FourierMzEmbedding: Fourier positional embeddings for m/z values
 - Spec2GraphDiffusion: Transformer + diffusion denoiser model
 - DiffusionTrainer: Training loop with DDPM schedule and sampling
+- SpectralGraphNeuralOperator: Decodes eigenvectors to adjacency matrices (SGNO)
+- DenseGNNDiscriminator: GNN-based chemical validity discriminator (Phase 1)
+- GuidedDiffusionSampler: Adversarial guidance via Tweedie's formula (Phase 1)
+- ValencyDecoder: Valency-constrained graph decoding (Phase 3)
+- EigenvalueConditioner: Eigenvalue conditioning module (Phase 4)
 
 Usage Example:
     Run `python spectral_diffusion.py` to see a complete example.
@@ -20,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union
 import warnings
 
 # Numerical floor to avoid divide-by-zero when reconstructing clean samples
@@ -378,6 +383,8 @@ class Spec2GraphDiffusion(nn.Module):
         dropout: float = 0.1,
         fingerprint_dim: int = 0,
         enable_atom_count_head: bool = False,
+        enable_eigenvalue_head: bool = False,
+        enable_precursor_conditioning: bool = False,
     ):
         """
         Initialize the Spec2Graph diffusion model.
@@ -394,6 +401,8 @@ class Spec2GraphDiffusion(nn.Module):
             dropout: Dropout rate
             fingerprint_dim: Optional size of fingerprint prediction head (0 to disable)
             enable_atom_count_head: Whether to add an atom-count prediction head for sampling
+            enable_eigenvalue_head: Whether to add an eigenvalue prediction head (Phase 4)
+            enable_precursor_conditioning: Whether to enable precursor m/z conditioning
         """
         super().__init__()
 
@@ -463,6 +472,22 @@ class Spec2GraphDiffusion(nn.Module):
         else:
             self.atom_count_head = None
 
+        # Phase 4: Eigenvalue prediction head
+        if enable_eigenvalue_head:
+            self.eigenvalue_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, k),
+            )
+        else:
+            self.eigenvalue_head = None
+
+        # Precursor conditioning: fuse precursor m/z into the global spectrum encoding
+        self.enable_precursor_conditioning = enable_precursor_conditioning
+        if enable_precursor_conditioning:
+            self.precursor_embedding = FourierMzEmbedding(d_model)
+            self.precursor_fusion = nn.Linear(d_model * 2, d_model)
+
     @staticmethod
     def _validate_mask(mask: torch.Tensor, name: str) -> None:
         """Ensure masks follow the True=valid convention and have at least one valid token."""
@@ -478,6 +503,7 @@ class Spec2GraphDiffusion(nn.Module):
         mz: torch.Tensor,
         intensity: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Encode mass spectrum data.
@@ -486,6 +512,7 @@ class Spec2GraphDiffusion(nn.Module):
             mz: m/z values, shape (batch, n_peaks)
             intensity: Intensity values, shape (batch, n_peaks)
             mask: Optional boolean mask for padding (True = valid), shape (batch, n_peaks)
+            precursor_mz: Optional precursor m/z values, shape (batch,)
 
         Returns:
             Encoded spectrum, shape (batch, n_peaks, d_model)
@@ -506,7 +533,21 @@ class Spec2GraphDiffusion(nn.Module):
         encoded = self.spectrum_encoder(
             spectrum_emb, src_key_padding_mask=src_key_padding_mask
         )
-        return self.encoder_norm(encoded)
+        encoded = self.encoder_norm(encoded)
+
+        # Apply precursor conditioning if enabled
+        if self.enable_precursor_conditioning and precursor_mz is not None:
+            # precursor_mz shape: (batch,) -> (batch, 1)
+            precursor_emb = self.precursor_embedding(precursor_mz.unsqueeze(-1))
+            # precursor_emb shape: (batch, 1, d_model)
+            pooled = self._pool_spectrum(encoded, mask)  # (batch, d_model)
+            fused = self.precursor_fusion(
+                torch.cat([pooled, precursor_emb.squeeze(1)], dim=-1)
+            )  # (batch, d_model)
+            # Add fused global context back to all positions
+            encoded = encoded + fused.unsqueeze(1)
+
+        return encoded
 
     def forward(
         self,
@@ -614,6 +655,27 @@ class Spec2GraphDiffusion(nn.Module):
         pooled = self._pool_spectrum(encoded, spectrum_mask)
         return self.atom_count_head(pooled).squeeze(-1)
 
+    def predict_eigenvalues(
+        self, mz: torch.Tensor, intensity: torch.Tensor, spectrum_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Predict Laplacian eigenvalues from spectrum input (Phase 4).
+
+        Args:
+            mz: m/z values, shape (batch, n_peaks)
+            intensity: Intensity values, shape (batch, n_peaks)
+            spectrum_mask: Optional boolean mask for valid peaks
+
+        Returns:
+            Predicted eigenvalues, shape (batch, k)
+        """
+        if self.eigenvalue_head is None:
+            raise ValueError(
+                "Eigenvalue head is disabled. Set enable_eigenvalue_head=True to enable predictions."
+            )
+        encoded = self.encode_spectrum(mz, intensity, spectrum_mask)
+        pooled = self._pool_spectrum(encoded, spectrum_mask)
+        return self.eigenvalue_head(pooled)
+
 
 class DiffusionTrainer:
     """Training and sampling utilities for DDPM diffusion."""
@@ -626,8 +688,10 @@ class DiffusionTrainer:
         beta_end: float = 0.02,
         device: str = "cpu",
         projection_loss_weight: float = 1.0,
+        orthonormality_loss_weight: float = 0.1,
         fingerprint_loss_weight: float = 0.0,
         atom_count_loss_weight: float = 0.0,
+        eigenvalue_loss_weight: float = 0.0,
     ):
         """
         Initialize the diffusion trainer.
@@ -639,15 +703,19 @@ class DiffusionTrainer:
             beta_end: Ending beta value
             device: Device to use
             projection_loss_weight: Weight for subspace-invariant projection loss
+            orthonormality_loss_weight: Weight for orthonormality regulariser on predicted eigenvectors
             fingerprint_loss_weight: Weight for optional fingerprint auxiliary loss
             atom_count_loss_weight: Weight for optional atom-count auxiliary loss
+            eigenvalue_loss_weight: Weight for eigenvalue prediction loss (Phase 4)
         """
         self.model = model
         self.n_timesteps = n_timesteps
         self.device = device
         self.projection_loss_weight = projection_loss_weight
+        self.orthonormality_loss_weight = orthonormality_loss_weight
         self.fingerprint_loss_weight = fingerprint_loss_weight
         self.atom_count_loss_weight = atom_count_loss_weight
+        self.eigenvalue_loss_weight = eigenvalue_loss_weight
 
         # DDPM schedule
         self.betas = torch.linspace(beta_start, beta_end, n_timesteps).to(device)
@@ -786,6 +854,29 @@ class DiffusionTrainer:
             x_t - sqrt_one_minus_alpha * predicted_noise, sqrt_alpha
         )
 
+    @staticmethod
+    def _orthonormality_loss(
+        embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute orthonormality regulariser: ||V_k^T V_k - I_k||_F^2.
+
+        Ensures predicted eigenvectors remain on the Stiefel manifold.
+
+        Args:
+            embeddings: Predicted eigenvectors, shape (batch, n_atoms, k)
+            mask: Optional boolean mask of valid atoms, shape (batch, n_atoms)
+
+        Returns:
+            Scalar loss
+        """
+        if mask is not None:
+            embeddings = embeddings * mask.unsqueeze(-1).float()
+        # V_k^T V_k -> (batch, k, k)
+        gram = torch.bmm(embeddings.transpose(-1, -2), embeddings)
+        k = embeddings.shape[-1]
+        identity = torch.eye(k, device=embeddings.device, dtype=embeddings.dtype).unsqueeze(0)
+        return ((gram - identity) ** 2).mean()
+
     def p_sample(
         self,
         x_t: torch.Tensor,
@@ -903,6 +994,7 @@ class DiffusionTrainer:
         spectrum_mask: Optional[torch.Tensor] = None,
         fingerprint_targets: Optional[torch.Tensor] = None,
         atom_count_targets: Optional[torch.Tensor] = None,
+        eigenvalue_targets: Optional[torch.Tensor] = None,
         return_components: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         """
@@ -916,6 +1008,7 @@ class DiffusionTrainer:
             spectrum_mask: Optional spectrum mask
             fingerprint_targets: Optional fingerprint labels for auxiliary loss
             atom_count_targets: Optional atom-count labels for auxiliary loss
+            eigenvalue_targets: Optional eigenvalue labels for Phase 4 auxiliary loss
             return_components: If True, also return component losses
 
         Returns:
@@ -942,11 +1035,14 @@ class DiffusionTrainer:
 
         loss = noise_loss
         proj_loss = torch.tensor(0.0, device=self.device)
+        ortho_loss = torch.tensor(0.0, device=self.device)
         fingerprint_loss = torch.tensor(0.0, device=self.device)
         atom_count_loss = torch.tensor(0.0, device=self.device)
+        eigenvalue_loss = torch.tensor(0.0, device=self.device)
 
-        # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
-        if self.projection_loss_weight > 0:
+        # Reconstruct x_0 for projection and orthonormality losses
+        x_0_pred = None
+        if self.projection_loss_weight > 0 or self.orthonormality_loss_weight > 0:
             sqrt_alpha = self.sqrt_alpha_cumprod_clamped[t].view(batch_size, 1, 1)
             sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod_clamped[t].view(
                 batch_size, 1, 1
@@ -956,6 +1052,8 @@ class DiffusionTrainer:
                 x_t, predicted_noise, sqrt_alpha, sqrt_one_minus_alpha
             )
 
+        # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
+        if self.projection_loss_weight > 0 and x_0_pred is not None:
             proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
             proj_target = self.projection_from_embeddings(x_0, atom_mask)
             mask_matrix = (
@@ -963,6 +1061,11 @@ class DiffusionTrainer:
             )
             proj_loss = self._masked_mse(proj_pred, proj_target, mask=mask_matrix)
             loss = loss + self.projection_loss_weight * proj_loss
+
+        # Orthonormality regulariser: ||V_k^T V_k - I_k||_F^2
+        if self.orthonormality_loss_weight > 0 and x_0_pred is not None:
+            ortho_loss = self._orthonormality_loss(x_0_pred, atom_mask)
+            loss = loss + self.orthonormality_loss_weight * ortho_loss
 
         if self.fingerprint_loss_weight > 0 and fingerprint_targets is not None:
             fp_logits = self.model.predict_fingerprint(mz, intensity, spectrum_mask)
@@ -974,12 +1077,20 @@ class DiffusionTrainer:
             atom_count_loss = F.mse_loss(atom_pred, atom_count_targets.float())
             loss = loss + self.atom_count_loss_weight * atom_count_loss
 
+        # Phase 4: Eigenvalue prediction loss
+        if self.eigenvalue_loss_weight > 0 and eigenvalue_targets is not None:
+            eigenvalue_pred = self.model.predict_eigenvalues(mz, intensity, spectrum_mask)
+            eigenvalue_loss = F.mse_loss(eigenvalue_pred, eigenvalue_targets)
+            loss = loss + self.eigenvalue_loss_weight * eigenvalue_loss
+
         if return_components:
             return loss, {
                 "noise": noise_loss.detach(),
                 "projection": proj_loss.detach(),
+                "orthonormality": ortho_loss.detach(),
                 "fingerprint": fingerprint_loss.detach(),
                 "atom_count": atom_count_loss.detach(),
+                "eigenvalue": eigenvalue_loss.detach(),
             }
 
         return loss
@@ -1049,6 +1160,555 @@ class DiffusionTrainer:
             return loss.item(), {k: v.item() for k, v in components.items()}
 
         return loss.item()
+
+
+# ==============================================================================
+# Section 3.5: Spectral Graph Neural Operator (SGNO) Decoder
+# ==============================================================================
+
+
+class SpectralGraphNeuralOperator(nn.Module):
+    """Spectral Graph Neural Operator (SGNO) that decodes predicted eigenvectors
+    into adjacency matrices.
+
+    Treats predicted eigenvectors as coordinates on a continuous manifold and
+    learns a resolution-invariant kernel to produce adjacency logits via
+    pairwise MLP interactions.
+    """
+
+    def __init__(self, k: int = 8, hidden_dim: int = 128, num_layers: int = 3):
+        """
+        Initialize the SGNO decoder.
+
+        Args:
+            k: Number of eigenvector dimensions per node
+            hidden_dim: Hidden dimension of the pairwise MLP
+            num_layers: Number of MLP layers
+        """
+        super().__init__()
+        self.k = k
+
+        layers: List[nn.Module] = []
+        in_dim = 2 * k  # concatenation of two node embeddings
+        for i in range(num_layers - 1):
+            out_dim = hidden_dim if i < num_layers - 2 else hidden_dim
+            layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU()])
+            in_dim = out_dim
+        layers.append(nn.Linear(in_dim, 1))
+        self.pairwise_mlp = nn.Sequential(*layers)
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Decode eigenvector embeddings to adjacency logits.
+
+        Args:
+            embeddings: Predicted eigenvectors, shape (batch, n_atoms, k)
+
+        Returns:
+            Symmetric adjacency logits, shape (batch, n_atoms, n_atoms)
+        """
+        batch_size, n_atoms, k = embeddings.shape
+
+        # Compute all pairwise concatenations [E_i ; E_j]
+        # Expand to (batch, n_atoms, n_atoms, k) for both i and j
+        e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
+        e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
+        pairs = torch.cat([e_i, e_j], dim=-1)  # (batch, n_atoms, n_atoms, 2k)
+
+        # Pass through pairwise MLP
+        logits = self.pairwise_mlp(pairs).squeeze(-1)  # (batch, n_atoms, n_atoms)
+
+        # Enforce symmetry: A = (A + A^T) / 2
+        logits = 0.5 * (logits + logits.transpose(-1, -2))
+
+        return logits
+
+    def decode_to_adjacency(
+        self, embeddings: torch.Tensor, threshold: float = 0.5
+    ) -> torch.Tensor:
+        """
+        Decode eigenvectors to a binary adjacency matrix.
+
+        Args:
+            embeddings: Predicted eigenvectors, shape (batch, n_atoms, k)
+            threshold: Probability threshold for bond prediction
+
+        Returns:
+            Binary adjacency matrix, shape (batch, n_atoms, n_atoms)
+        """
+        logits = self.forward(embeddings)
+        probs = torch.sigmoid(logits)
+        return (probs > threshold).float()
+
+    def bond_probabilities(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Get bond probabilities from eigenvector embeddings.
+
+        Args:
+            embeddings: Predicted eigenvectors, shape (batch, n_atoms, k)
+
+        Returns:
+            Bond probabilities, shape (batch, n_atoms, n_atoms)
+        """
+        logits = self.forward(embeddings)
+        return torch.sigmoid(logits)
+
+
+# ==============================================================================
+# Phase 1: GNN Discriminator for Chemical Validity (Section 5)
+# ==============================================================================
+
+
+class DenseGNNLayer(nn.Module):
+    """Dense GCN-style layer that operates on continuous adjacency matrices.
+
+    Uses dense matrix operations rather than sparse edge_index format, enabling
+    differentiable backpropagation through adjacency probabilities.
+    """
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.norm = nn.LayerNorm(out_features)
+
+    def forward(
+        self, x: torch.Tensor, adj: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Forward pass of dense GNN layer.
+
+        Args:
+            x: Node features, shape (batch, n_atoms, in_features)
+            adj: Dense adjacency matrix (probabilities), shape (batch, n_atoms, n_atoms)
+
+        Returns:
+            Updated node features, shape (batch, n_atoms, out_features)
+        """
+        # Degree normalisation: D^{-1/2} A D^{-1/2}
+        degree = adj.sum(dim=-1, keepdim=True).clamp(min=PROJECTION_EPS)
+        degree_inv_sqrt = 1.0 / torch.sqrt(degree)
+        # Normalised message passing
+        adj_norm = adj * degree_inv_sqrt * degree_inv_sqrt.transpose(-1, -2)
+        # Aggregate messages
+        agg = torch.bmm(adj_norm, x)
+        out = self.linear(agg)
+        return F.relu(self.norm(out))
+
+
+class DenseGNNDiscriminator(nn.Module):
+    """GNN-based chemical validity discriminator using dense adjacency operations.
+
+    Scores molecular graphs for chemical validity (valency satisfaction,
+    connectivity, ring plausibility) using dense GNN layers that can
+    operate on continuous adjacency probability matrices.
+    """
+
+    def __init__(
+        self,
+        node_features: int = 1,
+        hidden_dim: int = 64,
+        num_layers: int = 3,
+    ):
+        """
+        Initialize the discriminator.
+
+        Args:
+            node_features: Input node feature dimension (default 1 for degree-based features)
+            hidden_dim: Hidden dimension of GNN layers
+            num_layers: Number of GNN layers
+        """
+        super().__init__()
+        self.node_proj = nn.Linear(node_features, hidden_dim)
+
+        self.gnn_layers = nn.ModuleList([
+            DenseGNNLayer(hidden_dim, hidden_dim) for _ in range(num_layers)
+        ])
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, adj_probs: torch.Tensor) -> torch.Tensor:
+        """
+        Score the chemical validity of a graph given adjacency probabilities.
+
+        Args:
+            adj_probs: Adjacency probability matrix, shape (batch, n_atoms, n_atoms)
+
+        Returns:
+            Validity scores, shape (batch, 1)
+        """
+        batch_size, n_atoms, _ = adj_probs.shape
+
+        # Use node degree as initial features
+        degree = adj_probs.sum(dim=-1, keepdim=True)  # (batch, n_atoms, 1)
+        x = self.node_proj(degree)  # (batch, n_atoms, hidden_dim)
+
+        # Message passing through GNN layers
+        for layer in self.gnn_layers:
+            x = x + layer(x, adj_probs)  # residual connection
+
+        # Global mean pooling
+        graph_emb = x.mean(dim=1)  # (batch, hidden_dim)
+
+        return self.classifier(graph_emb)  # (batch, 1)
+
+
+class GuidedDiffusionSampler:
+    """Adversarial guidance via Tweedie's formula for chemically valid generation.
+
+    At each reverse-diffusion step, estimates the denoised output via Tweedie's
+    formula, decodes it through the SGNO, scores validity via the discriminator,
+    and uses the gradient to steer the diffusion toward valid structures.
+    """
+
+    def __init__(
+        self,
+        trainer: DiffusionTrainer,
+        sgno: SpectralGraphNeuralOperator,
+        discriminator: DenseGNNDiscriminator,
+        guidance_scale: float = 1.0,
+    ):
+        """
+        Initialize the guided sampler.
+
+        Args:
+            trainer: The DiffusionTrainer instance with the model and schedule
+            sgno: The SGNO decoder for eigenvectors -> adjacency
+            discriminator: The chemical validity discriminator
+            guidance_scale: Scale factor for guidance gradients
+        """
+        self.trainer = trainer
+        self.sgno = sgno
+        self.discriminator = discriminator
+        self.guidance_scale = guidance_scale
+
+    def guided_sample(
+        self,
+        mz: torch.Tensor,
+        intensity: torch.Tensor,
+        n_atoms: int,
+        atom_mask: Optional[torch.Tensor] = None,
+        spectrum_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Generate eigenvectors with adversarial guidance for chemical validity.
+
+        Args:
+            mz: m/z values, shape (batch, n_peaks)
+            intensity: Intensity values, shape (batch, n_peaks)
+            n_atoms: Number of atoms to generate
+            atom_mask: Optional atom mask
+            spectrum_mask: Optional spectrum mask
+
+        Returns:
+            Generated eigenvectors, shape (batch, n_atoms, k)
+        """
+        device = self.trainer.device
+        batch_size = mz.shape[0]
+        k = self.trainer.model.k
+
+        # Start from pure noise
+        x_t = torch.randn(batch_size, n_atoms, k, device=device)
+
+        for t in reversed(range(self.trainer.n_timesteps)):
+            t_tensor = torch.full(
+                (batch_size,), t, device=device, dtype=torch.long
+            )
+
+            # Predict noise (standard reverse step)
+            with torch.no_grad():
+                eps_pred = self.trainer.model(
+                    x_t, t_tensor, mz, intensity, atom_mask, spectrum_mask
+                )
+
+            # Compute reverse mean
+            alpha = self.trainer.alphas[t]
+            alpha_cumprod = self.trainer.alpha_cumprod[t]
+            beta = self.trainer.betas[t]
+            mu = (1.0 / torch.sqrt(alpha)) * (
+                x_t - (beta / torch.sqrt(1.0 - alpha_cumprod)) * eps_pred
+            )
+
+            # Tweedie estimate of clean output for guidance
+            if self.guidance_scale > 0 and t > 0:
+                x_t_grad = x_t.detach().requires_grad_(True)
+
+                # Tweedie: x0_hat = (x_t - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
+                sqrt_alpha_bar = self.trainer.sqrt_alpha_cumprod[t]
+                sqrt_one_minus = self.trainer.sqrt_one_minus_alpha_cumprod[t]
+
+                eps_for_tweedie = self.trainer.model(
+                    x_t_grad, t_tensor, mz, intensity, atom_mask, spectrum_mask
+                )
+                x0_hat = (x_t_grad - sqrt_one_minus * eps_for_tweedie) / sqrt_alpha_bar.clamp(min=PROJECTION_EPS)
+
+                # Decode to adjacency and score validity
+                adj_probs = self.sgno.bond_probabilities(x0_hat)
+                validity_score = self.discriminator(adj_probs)
+
+                # Compute guidance gradient
+                grad = torch.autograd.grad(
+                    validity_score.sum(), x_t_grad, retain_graph=False
+                )[0]
+
+                mu = mu + self.guidance_scale * grad
+
+            # Add noise (except at t=0)
+            if t > 0:
+                noise = torch.randn_like(x_t)
+                variance = self.trainer.posterior_variance[t]
+                x_t = mu + torch.sqrt(variance) * noise
+            else:
+                x_t = mu
+
+        return x_t
+
+
+# ==============================================================================
+# Phase 3: Valency-Aware Decoding (Section 7)
+# ==============================================================================
+
+# Standard valency table for common elements in organic chemistry
+VALENCY_TABLE: Dict[str, int] = {
+    "C": 4,
+    "N": 3,
+    "O": 2,
+    "S": 2,
+    "P": 3,
+    "F": 1,
+    "Cl": 1,
+    "Br": 1,
+    "I": 1,
+    "Si": 4,
+    "B": 3,
+    "Se": 2,
+}
+
+
+class ValencyDecoder:
+    """Valency-constrained adjacency matrix decoder.
+
+    Replaces naive thresholding with a greedy algorithm that respects
+    chemical valency constraints, ensuring each atom does not exceed
+    its maximum bond order sum.
+    """
+
+    def __init__(
+        self,
+        valency_table: Optional[Dict[str, int]] = None,
+        default_valency: int = 4,
+    ):
+        """
+        Initialize the valency decoder.
+
+        Args:
+            valency_table: Mapping from element symbols to maximum valency
+            default_valency: Default valency for unknown elements
+        """
+        self.valency_table = valency_table if valency_table is not None else VALENCY_TABLE
+        self.default_valency = default_valency
+
+    def get_valency(self, atom_type: str) -> int:
+        """Get maximum valency for an atom type."""
+        return self.valency_table.get(atom_type, self.default_valency)
+
+    def decode(
+        self,
+        atom_types: List[str],
+        bond_probs: np.ndarray,
+        threshold: float = 0.3,
+        max_bond_order: int = 1,
+    ) -> np.ndarray:
+        """
+        Decode bond probabilities into a valency-constrained adjacency matrix.
+
+        Uses a greedy algorithm that processes candidate bonds in descending
+        order of probability and assigns bonds only when both atoms have
+        remaining valency capacity.
+
+        Args:
+            atom_types: List of element symbols for each atom
+            bond_probs: Bond probability matrix, shape (n_atoms, n_atoms)
+            threshold: Minimum probability to consider a bond
+            max_bond_order: Maximum bond order to assign (1 for single bonds)
+
+        Returns:
+            Adjacency matrix with bond orders, shape (n_atoms, n_atoms)
+        """
+        n_atoms = len(atom_types)
+        max_valency = [self.get_valency(a) for a in atom_types]
+        remaining_valency = list(max_valency)
+
+        adjacency = np.zeros((n_atoms, n_atoms), dtype=np.float32)
+
+        # Collect candidate bonds with their probabilities
+        candidates = []
+        for i in range(n_atoms):
+            for j in range(i + 1, n_atoms):
+                prob = float(bond_probs[i, j])
+                if prob >= threshold:
+                    candidates.append((prob, i, j))
+
+        # Sort by probability (descending)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        # Greedy assignment respecting valency
+        for prob, i, j in candidates:
+            feasible_order = min(remaining_valency[i], remaining_valency[j], max_bond_order)
+            if feasible_order > 0:
+                adjacency[i, j] = feasible_order
+                adjacency[j, i] = feasible_order
+                remaining_valency[i] -= feasible_order
+                remaining_valency[j] -= feasible_order
+
+        return adjacency
+
+    def decode_batch(
+        self,
+        atom_types_batch: List[List[str]],
+        bond_probs_batch: torch.Tensor,
+        threshold: float = 0.3,
+        max_bond_order: int = 1,
+    ) -> List[np.ndarray]:
+        """
+        Decode a batch of bond probabilities with valency constraints.
+
+        Args:
+            atom_types_batch: List of atom type lists for each molecule
+            bond_probs_batch: Bond probabilities, shape (batch, n_atoms, n_atoms)
+            threshold: Minimum probability threshold
+            max_bond_order: Maximum bond order
+
+        Returns:
+            List of adjacency matrices
+        """
+        results = []
+        probs_np = bond_probs_batch.detach().cpu().numpy()
+        for i, atom_types in enumerate(atom_types_batch):
+            adj = self.decode(atom_types, probs_np[i], threshold, max_bond_order)
+            results.append(adj)
+        return results
+
+
+# ==============================================================================
+# Phase 4: Eigenvalue Conditioning (Section 8)
+# ==============================================================================
+
+
+class EigenvalueConditioner(nn.Module):
+    """Conditions the SGNO or diffusion model on predicted eigenvalue spectra.
+
+    The eigenvalues of the Laplacian encode powerful graph invariants
+    (connectivity, bipartiteness, edge count). This module transforms
+    predicted eigenvalues into conditioning embeddings.
+    """
+
+    def __init__(self, k: int = 8, d_model: int = 256):
+        """
+        Initialize eigenvalue conditioner.
+
+        Args:
+            k: Number of eigenvalues
+            d_model: Output conditioning dimension
+        """
+        super().__init__()
+        self.k = k
+        self.encoder = nn.Sequential(
+            nn.Linear(k, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, eigenvalues: torch.Tensor) -> torch.Tensor:
+        """
+        Encode eigenvalues into a conditioning embedding.
+
+        Args:
+            eigenvalues: Predicted eigenvalues, shape (batch, k)
+
+        Returns:
+            Conditioning embedding, shape (batch, d_model)
+        """
+        return self.encoder(eigenvalues)
+
+
+class EigenvalueConditionedSGNO(nn.Module):
+    """SGNO decoder conditioned on predicted eigenvalue spectra (Phase 4).
+
+    Extends the base SGNO by incorporating eigenvalue conditioning into
+    the pairwise interaction kernel, constraining the space of valid
+    topologies.
+    """
+
+    def __init__(
+        self,
+        k: int = 8,
+        hidden_dim: int = 128,
+        num_layers: int = 3,
+        eigenvalue_dim: int = 64,
+    ):
+        """
+        Initialize eigenvalue-conditioned SGNO.
+
+        Args:
+            k: Eigenvector dimension per node
+            hidden_dim: Hidden dimension
+            num_layers: Number of MLP layers
+            eigenvalue_dim: Dimension of eigenvalue conditioning
+        """
+        super().__init__()
+        self.k = k
+        self.eigenvalue_encoder = EigenvalueConditioner(k, eigenvalue_dim)
+
+        # Pairwise MLP takes [E_i; E_j; eigenvalue_cond]
+        layers: List[nn.Module] = []
+        in_dim = 2 * k + eigenvalue_dim
+        for i in range(num_layers - 1):
+            out_dim = hidden_dim
+            layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU()])
+            in_dim = out_dim
+        layers.append(nn.Linear(in_dim, 1))
+        self.pairwise_mlp = nn.Sequential(*layers)
+
+    def forward(
+        self, embeddings: torch.Tensor, eigenvalues: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Decode eigenvectors to adjacency logits with eigenvalue conditioning.
+
+        Args:
+            embeddings: Predicted eigenvectors, shape (batch, n_atoms, k)
+            eigenvalues: Predicted eigenvalues, shape (batch, k)
+
+        Returns:
+            Symmetric adjacency logits, shape (batch, n_atoms, n_atoms)
+        """
+        batch_size, n_atoms, k = embeddings.shape
+
+        # Encode eigenvalues
+        eig_cond = self.eigenvalue_encoder(eigenvalues)  # (batch, eigenvalue_dim)
+
+        # Expand for pairwise computation
+        e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
+        e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
+        eig_expanded = eig_cond.unsqueeze(1).unsqueeze(1).expand(
+            -1, n_atoms, n_atoms, -1
+        )
+        pairs = torch.cat([e_i, e_j, eig_expanded], dim=-1)
+
+        logits = self.pairwise_mlp(pairs).squeeze(-1)
+        logits = 0.5 * (logits + logits.transpose(-1, -2))
+
+        return logits
+
+    def bond_probabilities(
+        self, embeddings: torch.Tensor, eigenvalues: torch.Tensor
+    ) -> torch.Tensor:
+        """Get bond probabilities with eigenvalue conditioning."""
+        return torch.sigmoid(self.forward(embeddings, eigenvalues))
 
 
 def create_synthetic_demo_dataset(
