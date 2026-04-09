@@ -133,6 +133,10 @@ class TestSpectralGraphNeuralOperator:
         probs = sgno.bond_probabilities(embeddings)
         assert (probs >= 0).all()
         assert (probs <= 1).all()
+        assert torch.allclose(
+            torch.diagonal(probs, dim1=-2, dim2=-1),
+            torch.zeros(2, 5),
+        )
 
     def test_sgno_decode_to_adjacency_is_binary(self):
         sgno = SpectralGraphNeuralOperator(k=4, hidden_dim=32, num_layers=2)
@@ -140,6 +144,10 @@ class TestSpectralGraphNeuralOperator:
         adj = sgno.decode_to_adjacency(embeddings)
         unique_vals = torch.unique(adj)
         assert all(v in [0.0, 1.0] for v in unique_vals.tolist())
+        assert torch.allclose(
+            torch.diagonal(adj, dim1=-2, dim2=-1),
+            torch.zeros(2, 5),
+        )
 
     def test_sgno_single_atom_produces_zero_adjacency(self):
         """A single atom should have no bonds."""
@@ -176,6 +184,11 @@ class TestSpectralGraphNeuralOperator:
 
 
 class TestOrthonormalityLoss:
+    def test_default_orthonormality_weight_is_backward_compatible(self):
+        model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4)
+        trainer = DiffusionTrainer(model, n_timesteps=5)
+        assert trainer.orthonormality_loss_weight == 0.0
+
     def test_orthonormal_input_gives_near_zero_loss(self):
         """Orthonormal columns should produce ~0 loss."""
         q, _ = torch.linalg.qr(torch.randn(6, 4))
@@ -235,11 +248,15 @@ class TestPrecursorConditioning:
             num_encoder_layers=1, num_decoder_layers=1,
             enable_precursor_conditioning=True
         )
+        model.eval()
         mz = torch.randn(2, 10)
         intensity = torch.randn(2, 10)
 
-        enc_no_precursor = model.encode_spectrum(mz, intensity)
-        enc_with_precursor = model.encode_spectrum(mz, intensity, precursor_mz=torch.tensor([100.0, 200.0]))
+        with torch.no_grad():
+            enc_no_precursor = model.encode_spectrum(mz, intensity)
+            enc_with_precursor = model.encode_spectrum(
+                mz, intensity, precursor_mz=torch.tensor([100.0, 200.0])
+            )
 
         # Should be different when precursor is provided
         assert not torch.allclose(enc_no_precursor, enc_with_precursor, atol=1e-6)
@@ -275,6 +292,54 @@ class TestPrecursorConditioning:
         # Should not raise even when precursor_mz is passed
         enc = model.encode_spectrum(mz, intensity, precursor_mz=torch.tensor([100.0, 200.0]))
         assert enc.shape == (2, 10, 32)
+
+    def test_compute_loss_changes_with_precursor_conditioning(self):
+        """compute_loss should thread precursor mass through the main training path."""
+        model = Spec2GraphDiffusion(
+            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            num_encoder_layers=1, num_decoder_layers=1,
+            enable_precursor_conditioning=True
+        )
+        model.eval()
+        trainer = DiffusionTrainer(model, n_timesteps=5)
+        x_0 = torch.randn(1, 4, 2)
+        mz = torch.randn(1, 4)
+        intensity = torch.randn(1, 4)
+
+        with torch.no_grad():
+            torch.manual_seed(7)
+            loss_low = trainer.compute_loss(
+                x_0, mz, intensity, precursor_mz=torch.tensor([100.0])
+            )
+            torch.manual_seed(7)
+            loss_high = trainer.compute_loss(
+                x_0, mz, intensity, precursor_mz=torch.tensor([500.0])
+            )
+
+        assert not torch.allclose(loss_low, loss_high)
+
+    def test_sample_changes_with_precursor_conditioning(self):
+        """sample should thread precursor mass through the reverse diffusion path."""
+        model = Spec2GraphDiffusion(
+            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            num_encoder_layers=1, num_decoder_layers=1,
+            enable_precursor_conditioning=True
+        )
+        model.eval()
+        trainer = DiffusionTrainer(model, n_timesteps=3)
+        mz = torch.randn(1, 4)
+        intensity = torch.randn(1, 4)
+
+        torch.manual_seed(13)
+        sample_low = trainer.sample(
+            mz, intensity, n_atoms=4, precursor_mz=torch.tensor([100.0])
+        )
+        torch.manual_seed(13)
+        sample_high = trainer.sample(
+            mz, intensity, n_atoms=4, precursor_mz=torch.tensor([500.0])
+        )
+
+        assert not torch.allclose(sample_low, sample_high)
 
 
 # ==============================================================================
@@ -393,6 +458,46 @@ class TestGuidedDiffusionSampler:
         guided = sampler.guided_sample(mz, intensity, n_atoms=4)
 
         assert torch.allclose(unguided, guided, atol=1e-5)
+
+    def test_guidance_masks_invalid_atoms(self):
+        """Invalid atoms should be masked out before SGNO/discriminator guidance."""
+        class RecordingSGNO(SpectralGraphNeuralOperator):
+            def __init__(self):
+                super().__init__(k=2, hidden_dim=16, num_layers=2)
+                self.last_embeddings = None
+
+            def bond_probabilities(self, embeddings):
+                self.last_embeddings = embeddings.detach().clone()
+                return super().bond_probabilities(embeddings)
+
+        class RecordingDiscriminator(DenseGNNDiscriminator):
+            def __init__(self):
+                super().__init__(node_features=1, hidden_dim=16, num_layers=1)
+                self.last_adj_probs = None
+
+            def forward(self, adj_probs):
+                self.last_adj_probs = adj_probs.detach().clone()
+                return super().forward(adj_probs)
+
+        model = Spec2GraphDiffusion(
+            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            num_encoder_layers=1, num_decoder_layers=1
+        )
+        trainer = DiffusionTrainer(model, n_timesteps=3)
+        sgno = RecordingSGNO()
+        disc = RecordingDiscriminator()
+        sampler = GuidedDiffusionSampler(trainer, sgno, disc, guidance_scale=0.5)
+
+        mz = torch.randn(1, 4)
+        intensity = torch.randn(1, 4)
+        atom_mask = torch.tensor([[True, True, False, False]])
+        sampler.guided_sample(mz, intensity, n_atoms=4, atom_mask=atom_mask)
+
+        assert sgno.last_embeddings is not None
+        assert disc.last_adj_probs is not None
+        assert torch.allclose(sgno.last_embeddings[0, 2:], torch.zeros_like(sgno.last_embeddings[0, 2:]))
+        assert torch.allclose(disc.last_adj_probs[0, 2:, :], torch.zeros_like(disc.last_adj_probs[0, 2:, :]))
+        assert torch.allclose(disc.last_adj_probs[0, :, 2:], torch.zeros_like(disc.last_adj_probs[0, :, 2:]))
 
 
 # ==============================================================================

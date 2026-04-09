@@ -557,6 +557,7 @@ class Spec2GraphDiffusion(nn.Module):
         intensity: torch.Tensor,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass: predict noise given noisy eigenvectors and spectrum.
@@ -568,6 +569,7 @@ class Spec2GraphDiffusion(nn.Module):
             intensity: Intensity values, shape (batch, n_peaks)
             atom_mask: Boolean mask for valid atoms (True = valid), shape (batch, n_atoms)
             spectrum_mask: Boolean mask for valid peaks (True = valid), shape (batch, n_peaks)
+            precursor_mz: Optional precursor m/z values, shape (batch,)
 
         Returns:
             Predicted noise, shape (batch, n_atoms, k)
@@ -581,7 +583,7 @@ class Spec2GraphDiffusion(nn.Module):
             )
 
         # Encode spectrum
-        memory = self.encode_spectrum(mz, intensity, spectrum_mask)
+        memory = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
 
         # Get timestep embedding
         t_emb = self.time_embedding(t)  # (batch, d_model)
@@ -634,29 +636,41 @@ class Spec2GraphDiffusion(nn.Module):
         return (encoded * spectrum_mask).sum(dim=1) / denom
 
     def predict_fingerprint(
-        self, mz: torch.Tensor, intensity: torch.Tensor, spectrum_mask: Optional[torch.Tensor] = None
+        self,
+        mz: torch.Tensor,
+        intensity: torch.Tensor,
+        spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict fingerprint logits from spectrum input."""
         if self.fingerprint_head is None:
             raise ValueError("Fingerprint head is disabled. Set fingerprint_dim>0 to enable.")
-        encoded = self.encode_spectrum(mz, intensity, spectrum_mask)
+        encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
         pooled = self._pool_spectrum(encoded, spectrum_mask)
         return self.fingerprint_head(pooled)
 
     def predict_atom_count(
-        self, mz: torch.Tensor, intensity: torch.Tensor, spectrum_mask: Optional[torch.Tensor] = None
+        self,
+        mz: torch.Tensor,
+        intensity: torch.Tensor,
+        spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict atom count (regression logit) from spectrum input."""
         if self.atom_count_head is None:
             raise ValueError(
                 "Atom count head is disabled. Set enable_atom_count_head=True to enable predictions."
             )
-        encoded = self.encode_spectrum(mz, intensity, spectrum_mask)
+        encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
         pooled = self._pool_spectrum(encoded, spectrum_mask)
         return self.atom_count_head(pooled).squeeze(-1)
 
     def predict_eigenvalues(
-        self, mz: torch.Tensor, intensity: torch.Tensor, spectrum_mask: Optional[torch.Tensor] = None
+        self,
+        mz: torch.Tensor,
+        intensity: torch.Tensor,
+        spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict Laplacian eigenvalues from spectrum input (Phase 4).
 
@@ -672,7 +686,7 @@ class Spec2GraphDiffusion(nn.Module):
             raise ValueError(
                 "Eigenvalue head is disabled. Set enable_eigenvalue_head=True to enable predictions."
             )
-        encoded = self.encode_spectrum(mz, intensity, spectrum_mask)
+        encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
         pooled = self._pool_spectrum(encoded, spectrum_mask)
         return self.eigenvalue_head(pooled)
 
@@ -688,7 +702,7 @@ class DiffusionTrainer:
         beta_end: float = 0.02,
         device: str = "cpu",
         projection_loss_weight: float = 1.0,
-        orthonormality_loss_weight: float = 0.1,
+        orthonormality_loss_weight: float = 0.0,
         fingerprint_loss_weight: float = 0.0,
         atom_count_loss_weight: float = 0.0,
         eigenvalue_loss_weight: float = 0.0,
@@ -885,6 +899,7 @@ class DiffusionTrainer:
         intensity: torch.Tensor,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample from p(x_{t-1} | x_t).
@@ -896,6 +911,7 @@ class DiffusionTrainer:
             intensity: Intensity values
             atom_mask: Atom mask
             spectrum_mask: Spectrum mask
+            precursor_mz: Optional precursor m/z values
 
         Returns:
             Denoised sample
@@ -906,7 +922,7 @@ class DiffusionTrainer:
         # Predict noise
         with torch.no_grad():
             predicted_noise = self.model(
-                x_t, t_tensor, mz, intensity, atom_mask, spectrum_mask
+                x_t, t_tensor, mz, intensity, atom_mask, spectrum_mask, precursor_mz
             )
 
         # Compute x_{t-1}
@@ -936,6 +952,7 @@ class DiffusionTrainer:
         n_atoms: Optional[int] = None,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Generate eigenvectors by reverse diffusion.
@@ -946,6 +963,7 @@ class DiffusionTrainer:
             n_atoms: Number of atoms to generate (if None, predicted from spectrum)
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
+            precursor_mz: Optional precursor m/z values, shape (batch,)
             
         Note:
             When ``n_atoms`` is None, this relies on a trained atom-count head
@@ -958,7 +976,9 @@ class DiffusionTrainer:
         k = self.model.k
 
         if n_atoms is None:
-            count_pred = self.model.predict_atom_count(mz, intensity, spectrum_mask)
+            count_pred = self.model.predict_atom_count(
+                mz, intensity, spectrum_mask, precursor_mz
+            )
             n_atoms_per_sample = torch.clamp(
                 torch.round(count_pred), 1, self.model.max_atoms
             ).long()
@@ -981,7 +1001,9 @@ class DiffusionTrainer:
 
         # Reverse diffusion
         for t in reversed(range(self.n_timesteps)):
-            x_t = self.p_sample(x_t, t, mz, intensity, atom_mask, spectrum_mask)
+            x_t = self.p_sample(
+                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+            )
 
         return x_t
 
@@ -992,6 +1014,7 @@ class DiffusionTrainer:
         intensity: torch.Tensor,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
         fingerprint_targets: Optional[torch.Tensor] = None,
         atom_count_targets: Optional[torch.Tensor] = None,
         eigenvalue_targets: Optional[torch.Tensor] = None,
@@ -1006,6 +1029,7 @@ class DiffusionTrainer:
             intensity: Intensity values, shape (batch, n_peaks)
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
+            precursor_mz: Optional precursor m/z values
             fingerprint_targets: Optional fingerprint labels for auxiliary loss
             atom_count_targets: Optional atom-count labels for auxiliary loss
             eigenvalue_targets: Optional eigenvalue labels for Phase 4 auxiliary loss
@@ -1025,7 +1049,7 @@ class DiffusionTrainer:
 
         # Predict noise
         predicted_noise = self.model(
-            x_t, t, mz, intensity, atom_mask, spectrum_mask
+            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
         )
 
         # Compute loss (only on valid atoms if mask provided)
@@ -1068,18 +1092,24 @@ class DiffusionTrainer:
             loss = loss + self.orthonormality_loss_weight * ortho_loss
 
         if self.fingerprint_loss_weight > 0 and fingerprint_targets is not None:
-            fp_logits = self.model.predict_fingerprint(mz, intensity, spectrum_mask)
+            fp_logits = self.model.predict_fingerprint(
+                mz, intensity, spectrum_mask, precursor_mz
+            )
             fingerprint_loss = F.binary_cross_entropy_with_logits(fp_logits, fingerprint_targets)
             loss = loss + self.fingerprint_loss_weight * fingerprint_loss
 
         if self.atom_count_loss_weight > 0 and atom_count_targets is not None:
-            atom_pred = self.model.predict_atom_count(mz, intensity, spectrum_mask)
+            atom_pred = self.model.predict_atom_count(
+                mz, intensity, spectrum_mask, precursor_mz
+            )
             atom_count_loss = F.mse_loss(atom_pred, atom_count_targets.float())
             loss = loss + self.atom_count_loss_weight * atom_count_loss
 
         # Phase 4: Eigenvalue prediction loss
         if self.eigenvalue_loss_weight > 0 and eigenvalue_targets is not None:
-            eigenvalue_pred = self.model.predict_eigenvalues(mz, intensity, spectrum_mask)
+            eigenvalue_pred = self.model.predict_eigenvalues(
+                mz, intensity, spectrum_mask, precursor_mz
+            )
             eigenvalue_loss = F.mse_loss(eigenvalue_pred, eigenvalue_targets)
             loss = loss + self.eigenvalue_loss_weight * eigenvalue_loss
 
@@ -1103,6 +1133,7 @@ class DiffusionTrainer:
         intensity: torch.Tensor,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
         fingerprint_targets: Optional[torch.Tensor] = None,
         atom_count_targets: Optional[torch.Tensor] = None,
         eigenvalue_targets: Optional[torch.Tensor] = None,
@@ -1118,6 +1149,7 @@ class DiffusionTrainer:
             intensity: Intensity values
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
+            precursor_mz: Optional precursor m/z values
             fingerprint_targets: Optional fingerprint labels
             atom_count_targets: Optional atom-count labels
             eigenvalue_targets: Optional eigenvalue labels for Phase 4 loss
@@ -1136,6 +1168,7 @@ class DiffusionTrainer:
                 intensity,
                 atom_mask,
                 spectrum_mask,
+                precursor_mz,
                 fingerprint_targets,
                 atom_count_targets,
                 eigenvalue_targets,
@@ -1149,6 +1182,7 @@ class DiffusionTrainer:
                     intensity,
                     atom_mask,
                     spectrum_mask,
+                    precursor_mz,
                     fingerprint_targets,
                     atom_count_targets,
                     eigenvalue_targets,
@@ -1201,6 +1235,15 @@ class SpectralGraphNeuralOperator(nn.Module):
         layers.append(nn.Linear(in_dim, 1))
         self.pairwise_mlp = nn.Sequential(*layers)
 
+    @staticmethod
+    def _zero_diagonal(matrix: torch.Tensor) -> torch.Tensor:
+        """Force zero self-loops for batched square matrices."""
+        n_atoms = matrix.shape[-1]
+        diagonal_mask = torch.eye(
+            n_atoms, device=matrix.device, dtype=torch.bool
+        ).unsqueeze(0)
+        return matrix.masked_fill(diagonal_mask, 0.0)
+
     def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
         """
         Decode eigenvector embeddings to adjacency logits.
@@ -1224,6 +1267,7 @@ class SpectralGraphNeuralOperator(nn.Module):
 
         # Enforce symmetry: A = (A + A^T) / 2
         logits = 0.5 * (logits + logits.transpose(-1, -2))
+        logits = self._zero_diagonal(logits)
 
         return logits
 
@@ -1242,6 +1286,7 @@ class SpectralGraphNeuralOperator(nn.Module):
         """
         logits = self.forward(embeddings)
         probs = torch.sigmoid(logits)
+        probs = self._zero_diagonal(probs)
         return (probs > threshold).float()
 
     def bond_probabilities(self, embeddings: torch.Tensor) -> torch.Tensor:
@@ -1255,7 +1300,8 @@ class SpectralGraphNeuralOperator(nn.Module):
             Bond probabilities, shape (batch, n_atoms, n_atoms)
         """
         logits = self.forward(embeddings)
-        return torch.sigmoid(logits)
+        probs = torch.sigmoid(logits)
+        return self._zero_diagonal(probs)
 
 
 # ==============================================================================
@@ -1396,6 +1442,7 @@ class GuidedDiffusionSampler:
         n_atoms: int,
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Generate eigenvectors with adversarial guidance for chemical validity.
@@ -1406,6 +1453,7 @@ class GuidedDiffusionSampler:
             n_atoms: Number of atoms to generate
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
+            precursor_mz: Optional precursor m/z values
 
         Returns:
             Generated eigenvectors, shape (batch, n_atoms, k)
@@ -1425,7 +1473,13 @@ class GuidedDiffusionSampler:
             # Predict noise (standard reverse step)
             with torch.no_grad():
                 eps_pred = self.trainer.model(
-                    x_t, t_tensor, mz, intensity, atom_mask, spectrum_mask
+                    x_t,
+                    t_tensor,
+                    mz,
+                    intensity,
+                    atom_mask,
+                    spectrum_mask,
+                    precursor_mz,
                 )
 
             # Compute reverse mean
@@ -1445,19 +1499,33 @@ class GuidedDiffusionSampler:
                 sqrt_one_minus = self.trainer.sqrt_one_minus_alpha_cumprod[t]
 
                 eps_for_tweedie = self.trainer.model(
-                    x_t_grad, t_tensor, mz, intensity, atom_mask, spectrum_mask
+                    x_t_grad,
+                    t_tensor,
+                    mz,
+                    intensity,
+                    atom_mask,
+                    spectrum_mask,
+                    precursor_mz,
                 )
                 x0_hat = DiffusionTrainer._safe_divide(
                     x_t_grad - sqrt_one_minus * eps_for_tweedie, sqrt_alpha_bar
                 )
 
+                if atom_mask is not None:
+                    node_mask = atom_mask.to(device=x0_hat.device, dtype=x0_hat.dtype)
+                    x0_hat = x0_hat * node_mask.unsqueeze(-1)
+
                 # Decode to adjacency and score validity
                 adj_probs = self.sgno.bond_probabilities(x0_hat)
-                validity_score = self.discriminator(adj_probs)
+                if atom_mask is not None:
+                    edge_mask = atom_mask.to(device=adj_probs.device, dtype=adj_probs.dtype)
+                    edge_mask = edge_mask.unsqueeze(-1) * edge_mask.unsqueeze(-2)
+                    adj_probs = adj_probs * edge_mask
+                validity_log_prob = F.logsigmoid(self.discriminator(adj_probs))
 
                 # Compute guidance gradient
                 grad = torch.autograd.grad(
-                    validity_score.sum(), x_t_grad, retain_graph=False
+                    validity_log_prob.sum(), x_t_grad, retain_graph=False
                 )[0]
 
                 mu = mu + self.guidance_scale * grad
