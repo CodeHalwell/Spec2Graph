@@ -135,7 +135,7 @@ class TestSpectralGraphNeuralOperator:
         assert (probs <= 1).all()
         assert torch.allclose(
             torch.diagonal(probs, dim1=-2, dim2=-1),
-            torch.zeros(2, 5),
+            torch.zeros_like(torch.diagonal(probs, dim1=-2, dim2=-1)),
         )
 
     def test_sgno_decode_to_adjacency_is_binary(self):
@@ -146,7 +146,7 @@ class TestSpectralGraphNeuralOperator:
         assert all(v in [0.0, 1.0] for v in unique_vals.tolist())
         assert torch.allclose(
             torch.diagonal(adj, dim1=-2, dim2=-1),
-            torch.zeros(2, 5),
+            torch.zeros_like(torch.diagonal(adj, dim1=-2, dim2=-1)),
         )
 
     def test_sgno_single_atom_produces_zero_adjacency(self):
@@ -500,12 +500,22 @@ class TestGuidedDiffusionSampler:
         intensity = torch.randn(1, 4)
         atom_mask = torch.tensor([[True, True, False, False]])
         sampler.guided_sample(mz, intensity, n_atoms=4, atom_mask=atom_mask)
+        first_invalid_atom = 2
 
         assert sgno.last_embeddings is not None
         assert disc.last_adj_probs is not None
-        assert torch.allclose(sgno.last_embeddings[0, 2:], torch.zeros_like(sgno.last_embeddings[0, 2:]))
-        assert torch.allclose(disc.last_adj_probs[0, 2:, :], torch.zeros_like(disc.last_adj_probs[0, 2:, :]))
-        assert torch.allclose(disc.last_adj_probs[0, :, 2:], torch.zeros_like(disc.last_adj_probs[0, :, 2:]))
+        assert torch.allclose(
+            sgno.last_embeddings[0, first_invalid_atom:],
+            torch.zeros_like(sgno.last_embeddings[0, first_invalid_atom:]),
+        )
+        assert torch.allclose(
+            disc.last_adj_probs[0, first_invalid_atom:, :],
+            torch.zeros_like(disc.last_adj_probs[0, first_invalid_atom:, :]),
+        )
+        assert torch.allclose(
+            disc.last_adj_probs[0, :, first_invalid_atom:],
+            torch.zeros_like(disc.last_adj_probs[0, :, first_invalid_atom:]),
+        )
 
 
 # ==============================================================================
