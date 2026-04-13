@@ -101,6 +101,13 @@ def test_q_sample_reconstruct_is_stable():
     assert torch.allclose(x0, reconstructed, atol=1e-5)
 
 
+
+def test_smiles_to_adjacency_invalid_smiles():
+    processor = SpectralDataProcessor()
+    with pytest.raises(ValueError, match="Invalid SMILES: invalid"):
+        processor.smiles_to_adjacency("invalid")
+
+
 def test_bond_weighting_distinguishes_double_bond():
     single = SpectralDataProcessor(bond_weighting="order").smiles_to_adjacency("CC")
     double = SpectralDataProcessor(bond_weighting="order").smiles_to_adjacency("C=C")
