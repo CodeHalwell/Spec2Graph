@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Union
 import warnings
+from dataclasses import dataclass
 
 # Numerical floor to avoid divide-by-zero when reconstructing clean samples
 PROJECTION_EPS = 1e-8
@@ -363,7 +364,28 @@ class TimestepEmbedding(nn.Module):
         return self.mlp(embedding)
 
 
+
+
+@dataclass
+class Spec2GraphDiffusionConfig:
+    """Configuration for the Spec2GraphDiffusion model."""
+    d_model: int = 256
+    nhead: int = 8
+    num_encoder_layers: int = 4
+    num_decoder_layers: int = 4
+    dim_feedforward: int = 1024
+    k: int = 8
+    max_atoms: int = 64
+    max_peaks: int = 100
+    dropout: float = 0.1
+    fingerprint_dim: int = 0
+    enable_atom_count_head: bool = False
+    enable_eigenvalue_head: bool = False
+    enable_precursor_conditioning: bool = False
+
+
 class Spec2GraphDiffusion(nn.Module):
+
     """
     Transformer-based diffusion model for spectrum to graph conversion.
 
@@ -372,121 +394,101 @@ class Spec2GraphDiffusion(nn.Module):
 
     def __init__(
         self,
-        d_model: int = 256,
-        nhead: int = 8,
-        num_encoder_layers: int = 4,
-        num_decoder_layers: int = 4,
-        dim_feedforward: int = 1024,
-        k: int = 8,
-        max_atoms: int = 64,
-        max_peaks: int = 100,
-        dropout: float = 0.1,
-        fingerprint_dim: int = 0,
-        enable_atom_count_head: bool = False,
-        enable_eigenvalue_head: bool = False,
-        enable_precursor_conditioning: bool = False,
+        config: Spec2GraphDiffusionConfig = None,
     ):
         """
         Initialize the Spec2Graph diffusion model.
 
         Args:
-            d_model: Model dimension
-            nhead: Number of attention heads
-            num_encoder_layers: Number of transformer encoder layers
-            num_decoder_layers: Number of transformer decoder layers
-            dim_feedforward: Feedforward dimension
-            k: Number of eigenvectors
-            max_atoms: Maximum number of atoms
-            max_peaks: Maximum number of spectrum peaks
-            dropout: Dropout rate
-            fingerprint_dim: Optional size of fingerprint prediction head (0 to disable)
-            enable_atom_count_head: Whether to add an atom-count prediction head for sampling
-            enable_eigenvalue_head: Whether to add an eigenvalue prediction head (Phase 4)
-            enable_precursor_conditioning: Whether to enable precursor m/z conditioning
+            config: Configuration for the diffusion model.
         """
         super().__init__()
 
-        self.d_model = d_model
-        self.k = k
-        self.max_atoms = max_atoms
-        self.max_peaks = max_peaks
+        if config is None:
+            config = Spec2GraphDiffusionConfig()
+
+        self.config = config
+        self.d_model = config.d_model
+        self.k = config.k
+        self.max_atoms = config.max_atoms
+        self.max_peaks = config.max_peaks
 
         # Spectrum encoding
-        self.mz_embedding = FourierMzEmbedding(d_model)
-        self.intensity_embedding = IntensityEmbedding(d_model)
+        self.mz_embedding = FourierMzEmbedding(config.d_model)
+        self.intensity_embedding = IntensityEmbedding(config.d_model)
 
         # Timestep embedding
-        self.time_embedding = TimestepEmbedding(d_model)
+        self.time_embedding = TimestepEmbedding(config.d_model)
 
         # Eigenvector embedding (project k-dim eigenvector to d_model)
-        self.eigenvec_in = nn.Linear(k, d_model)
-        self.eigenvec_out = nn.Linear(d_model, k)
+        self.eigenvec_in = nn.Linear(config.k, config.d_model)
+        self.eigenvec_out = nn.Linear(config.d_model, config.k)
 
         # Positional embeddings for atoms
-        self.atom_pos_embedding = nn.Embedding(max_atoms, d_model)
+        self.atom_pos_embedding = nn.Embedding(config.max_atoms, config.d_model)
 
         # Transformer encoder for spectrum
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
             batch_first=True,
         )
         self.spectrum_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_encoder_layers
+            encoder_layer, num_layers=config.num_encoder_layers
         )
 
         # Transformer decoder for eigenvectors
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
             batch_first=True,
         )
         self.decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=num_decoder_layers
+            decoder_layer, num_layers=config.num_decoder_layers
         )
 
         # Layer norms
-        self.encoder_norm = nn.LayerNorm(d_model)
-        self.decoder_norm = nn.LayerNorm(d_model)
+        self.encoder_norm = nn.LayerNorm(config.d_model)
+        self.decoder_norm = nn.LayerNorm(config.d_model)
 
         # Optional auxiliary heads
-        if fingerprint_dim > 0:
+        if config.fingerprint_dim > 0:
             self.fingerprint_head = nn.Sequential(
-                nn.Linear(d_model, d_model),
+                nn.Linear(config.d_model, config.d_model),
                 nn.ReLU(),
-                nn.Linear(d_model, fingerprint_dim),
+                nn.Linear(config.d_model, config.fingerprint_dim),
             )
         else:
             self.fingerprint_head = None
 
-        if enable_atom_count_head:
+        if config.enable_atom_count_head:
             self.atom_count_head = nn.Sequential(
-                nn.Linear(d_model, d_model),
+                nn.Linear(config.d_model, config.d_model),
                 nn.ReLU(),
-                nn.Linear(d_model, 1),
+                nn.Linear(config.d_model, 1),
             )
         else:
             self.atom_count_head = None
 
         # Phase 4: Eigenvalue prediction head
-        if enable_eigenvalue_head:
+        if config.enable_eigenvalue_head:
             self.eigenvalue_head = nn.Sequential(
-                nn.Linear(d_model, d_model),
+                nn.Linear(config.d_model, config.d_model),
                 nn.ReLU(),
-                nn.Linear(d_model, k),
+                nn.Linear(config.d_model, config.k),
             )
         else:
             self.eigenvalue_head = None
 
         # Precursor conditioning: fuse precursor m/z into the global spectrum encoding
-        self.enable_precursor_conditioning = enable_precursor_conditioning
-        if enable_precursor_conditioning:
-            self.precursor_embedding = FourierMzEmbedding(d_model)
-            self.precursor_fusion = nn.Linear(d_model * 2, d_model)
+        self.enable_precursor_conditioning = config.enable_precursor_conditioning
+        if config.enable_precursor_conditioning:
+            self.precursor_embedding = FourierMzEmbedding(config.d_model)
+            self.precursor_fusion = nn.Linear(config.d_model * 2, config.d_model)
 
     @staticmethod
     def _validate_mask(mask: torch.Tensor, name: str) -> None:
@@ -1903,7 +1905,7 @@ def run_demo():
 
     # Create model
     print("\n2. Creating Spec2GraphDiffusion model...")
-    model = Spec2GraphDiffusion(
+    config = Spec2GraphDiffusionConfig(
         d_model=128,
         nhead=4,
         num_encoder_layers=2,
@@ -1915,7 +1917,8 @@ def run_demo():
         dropout=0.1,
         fingerprint_dim=fp_targets.shape[-1],
         enable_atom_count_head=True,
-    ).to(device)
+    )
+    model = Spec2GraphDiffusion(config).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   Total parameters: {total_params:,}")

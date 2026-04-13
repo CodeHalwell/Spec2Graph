@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from spectral_diffusion import (
+    Spec2GraphDiffusionConfig,
     DiffusionTrainer,
     SpectralDataProcessor,
     Spec2GraphDiffusion,
@@ -74,7 +75,7 @@ def test_extract_eigenvectors_skips_all_zero_eigenvalues_for_disconnected_graph(
 
 
 def test_forward_raises_when_atoms_exceed_max():
-    model = Spec2GraphDiffusion(k=2, max_atoms=2, max_peaks=4)
+    model = Spec2GraphDiffusion(Spec2GraphDiffusionConfig(k=2, max_atoms=2, max_peaks=4))
     x_t = torch.randn(1, 3, 2)
     t = torch.zeros(1, dtype=torch.long)
     mz = torch.zeros(1, 4)
@@ -85,7 +86,7 @@ def test_forward_raises_when_atoms_exceed_max():
 
 
 def test_q_sample_reconstruct_is_stable():
-    model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4)
+    model = Spec2GraphDiffusion(Spec2GraphDiffusionConfig(k=2, max_atoms=4, max_peaks=4))
     trainer = DiffusionTrainer(model, n_timesteps=5)
     x0 = torch.randn(1, 4, 2)
     t = torch.tensor([1])
@@ -185,7 +186,7 @@ class TestSpectralGraphNeuralOperator:
 
 class TestOrthonormalityLoss:
     def test_default_orthonormality_weight_is_backward_compatible(self):
-        model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4)
+        model = Spec2GraphDiffusion(Spec2GraphDiffusionConfig(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4))
         trainer = DiffusionTrainer(model, n_timesteps=5)
         assert trainer.orthonormality_loss_weight == 0.0
 
@@ -214,7 +215,7 @@ class TestOrthonormalityLoss:
 
     def test_orthonormality_loss_integrated_in_compute_loss(self):
         """Verify orthonormality loss appears in compute_loss components."""
-        model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4)
+        model = Spec2GraphDiffusion(Spec2GraphDiffusionConfig(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4))
         trainer = DiffusionTrainer(model, n_timesteps=5, orthonormality_loss_weight=1.0)
         x_0 = torch.randn(2, 4, 2)
         mz = torch.randn(2, 4)
@@ -226,7 +227,7 @@ class TestOrthonormalityLoss:
 
     def test_zero_orthonormality_weight_skips_computation(self):
         """When weight is 0, orthonormality loss should be 0."""
-        model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4)
+        model = Spec2GraphDiffusion(Spec2GraphDiffusionConfig(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4))
         trainer = DiffusionTrainer(model, n_timesteps=5, orthonormality_loss_weight=0.0)
         x_0 = torch.randn(2, 4, 2)
         mz = torch.randn(2, 4)
@@ -244,9 +245,11 @@ class TestPrecursorConditioning:
     def test_precursor_conditioning_changes_output(self):
         """Precursor conditioning should alter the encoded spectrum."""
         model = Spec2GraphDiffusion(
-            k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1,
             enable_precursor_conditioning=True
+            )
         )
         model.eval()
         mz = torch.randn(2, 10)
@@ -264,9 +267,11 @@ class TestPrecursorConditioning:
     def test_precursor_conditioning_different_masses_differ(self):
         """Different precursor masses should produce different encodings."""
         model = Spec2GraphDiffusion(
-            k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1,
             enable_precursor_conditioning=True
+            )
         )
         model.eval()  # disable dropout for deterministic comparison
         mz = torch.randn(1, 10).expand(2, -1)
@@ -283,9 +288,11 @@ class TestPrecursorConditioning:
     def test_model_without_precursor_conditioning(self):
         """Model without precursor conditioning should work normally."""
         model = Spec2GraphDiffusion(
-            k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1,
             enable_precursor_conditioning=False
+            )
         )
         mz = torch.randn(2, 10)
         intensity = torch.randn(2, 10)
@@ -296,9 +303,11 @@ class TestPrecursorConditioning:
     def test_compute_loss_changes_with_precursor_conditioning(self):
         """compute_loss should thread precursor mass through the main training path."""
         model = Spec2GraphDiffusion(
-            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1,
             enable_precursor_conditioning=True
+            )
         )
         model.eval()
         trainer = DiffusionTrainer(model, n_timesteps=5)
@@ -325,9 +334,11 @@ class TestPrecursorConditioning:
     def test_sample_changes_with_precursor_conditioning(self):
         """sample should thread precursor mass through the reverse diffusion path."""
         model = Spec2GraphDiffusion(
-            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1,
             enable_precursor_conditioning=True
+            )
         )
         model.eval()
         trainer = DiffusionTrainer(model, n_timesteps=3)
@@ -398,8 +409,10 @@ class TestDenseGNNDiscriminator:
 class TestGuidedDiffusionSampler:
     def _make_sampler(self):
         model = Spec2GraphDiffusion(
-            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1
+            )
         )
         trainer = DiffusionTrainer(model, n_timesteps=3)
         sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=16, num_layers=2)
@@ -424,8 +437,10 @@ class TestGuidedDiffusionSampler:
         """Guided sampling should produce different results from unguided."""
         torch.manual_seed(0)
         model = Spec2GraphDiffusion(
-            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1
+            )
         )
         trainer = DiffusionTrainer(model, n_timesteps=3)
         sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=16, num_layers=2)
@@ -449,8 +464,10 @@ class TestGuidedDiffusionSampler:
     def test_zero_guidance_scale(self):
         """With guidance_scale=0, guided sampling should match standard sampling."""
         model = Spec2GraphDiffusion(
-            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1
+            )
         )
         trainer = DiffusionTrainer(model, n_timesteps=3)
         sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=16, num_layers=2)
@@ -488,8 +505,10 @@ class TestGuidedDiffusionSampler:
                 return super().forward(adj_probs)
 
         model = Spec2GraphDiffusion(
-            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1
+            )
         )
         trainer = DiffusionTrainer(model, n_timesteps=3)
         sgno = RecordingSGNO()
@@ -616,9 +635,11 @@ class TestEigenvalueConditioning:
 
     def test_eigenvalue_head_prediction_shape(self):
         model = Spec2GraphDiffusion(
-            k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1,
             enable_eigenvalue_head=True
+            )
         )
         mz = torch.randn(2, 10)
         intensity = torch.randn(2, 10)
@@ -627,8 +648,10 @@ class TestEigenvalueConditioning:
 
     def test_eigenvalue_head_disabled_raises(self):
         model = Spec2GraphDiffusion(
-            k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
             enable_eigenvalue_head=False
+            )
         )
         mz = torch.randn(1, 10)
         intensity = torch.randn(1, 10)
@@ -673,9 +696,11 @@ class TestEigenvalueConditioning:
     def test_eigenvalue_loss_in_compute_loss(self):
         """Verify eigenvalue loss appears when enabled."""
         model = Spec2GraphDiffusion(
-            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1,
             enable_eigenvalue_head=True
+            )
         )
         trainer = DiffusionTrainer(
             model, n_timesteps=5, eigenvalue_loss_weight=1.0
@@ -728,10 +753,12 @@ class TestEndToEndPipeline:
     def test_training_step_with_all_losses(self):
         """Verify a training step works with all loss components enabled."""
         model = Spec2GraphDiffusion(
-            k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1,
             fingerprint_dim=16, enable_atom_count_head=True,
             enable_eigenvalue_head=True
+            )
         )
         trainer = DiffusionTrainer(
             model, n_timesteps=5,
