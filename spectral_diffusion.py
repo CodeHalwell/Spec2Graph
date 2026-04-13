@@ -163,15 +163,20 @@ class SpectralDataProcessor:
 
         # Sign canonicalization: ensure first non-zero element is positive
         if canonicalize:
-            for i in range(selected.shape[1]):
-                col = selected[:, i]
-                abs_col = np.abs(col)
-                if np.any(abs_col > 1e-10):
-                    idx = np.argmax(abs_col > 1e-10)
-                else:
-                    idx = np.argmax(abs_col)
-                if col[idx] < 0:
-                    selected[:, i] = -col
+            mask = np.abs(selected) > 1e-10
+            has_nonzero = mask.any(axis=0)
+            idx = mask.argmax(axis=0)
+
+            # For columns with all elements <= 1e-10, fallback to standard argmax of absolute values
+            zero_cols = ~has_nonzero
+            if zero_cols.any():
+                idx[zero_cols] = np.abs(selected[:, zero_cols]).argmax(axis=0)
+
+            col_idx = np.arange(selected.shape[1])
+            first_vals = selected[idx, col_idx]
+
+            signs = np.where(first_vals < 0, -1, 1)
+            selected *= signs
 
         # Pad with zeros if needed
         if selected.shape[1] < self.k:
