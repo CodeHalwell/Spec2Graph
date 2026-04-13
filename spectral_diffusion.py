@@ -258,9 +258,7 @@ class FourierMzEmbedding(nn.Module):
 
         # Create frequency bands
         freqs = torch.exp(
-            torch.linspace(
-                math.log(1.0), math.log(max_mz / 2.0), num_freqs // 2
-            )
+            torch.linspace(math.log(1.0), math.log(max_mz / 2.0), num_freqs // 2)
         )
         self.register_buffer("freqs", freqs)
 
@@ -492,11 +490,17 @@ class Spec2GraphDiffusion(nn.Module):
     def _validate_mask(mask: torch.Tensor, name: str) -> None:
         """Ensure masks follow the True=valid convention and have at least one valid token."""
         if mask.dtype != torch.bool:
-            raise ValueError(f"{name} must be a boolean tensor with True indicating valid entries.")
+            raise ValueError(
+                f"{name} must be a boolean tensor with True indicating valid entries."
+            )
         if mask.dim() < 2:
-            raise ValueError(f"{name} must have shape (batch, length); got {mask.shape}.")
+            raise ValueError(
+                f"{name} must have shape (batch, length); got {mask.shape}."
+            )
         if torch.any(mask.sum(dim=1) == 0):
-            raise ValueError(f"{name} must contain at least one valid element per batch item.")
+            raise ValueError(
+                f"{name} must contain at least one valid element per batch item."
+            )
 
     def encode_spectrum(
         self,
@@ -644,7 +648,9 @@ class Spec2GraphDiffusion(nn.Module):
     ) -> torch.Tensor:
         """Predict fingerprint logits from spectrum input."""
         if self.fingerprint_head is None:
-            raise ValueError("Fingerprint head is disabled. Set fingerprint_dim>0 to enable.")
+            raise ValueError(
+                "Fingerprint head is disabled. Set fingerprint_dim>0 to enable."
+            )
         encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
         pooled = self._pool_spectrum(encoded, spectrum_mask)
         return self.fingerprint_head(pooled)
@@ -749,7 +755,9 @@ class DiffusionTrainer:
         self.sqrt_recip_alpha = torch.sqrt(1.0 / self.alphas)
         # Add small epsilon to denominator for numerical stability (avoids div by zero at t=0)
         self.posterior_variance = (
-            self.betas * (1.0 - self.alpha_cumprod_prev) / (1.0 - self.alpha_cumprod + 1e-8)
+            self.betas
+            * (1.0 - self.alpha_cumprod_prev)
+            / (1.0 - self.alpha_cumprod + 1e-8)
         )
 
     def q_sample(
@@ -836,7 +844,9 @@ class DiffusionTrainer:
         return proj
 
     @staticmethod
-    def _safe_divide(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+    def _safe_divide(
+        numerator: torch.Tensor, denominator: torch.Tensor
+    ) -> torch.Tensor:
         """Numerically stable division with clamped denominator."""
         return numerator / torch.clamp(denominator, min=PROJECTION_EPS)
 
@@ -888,7 +898,9 @@ class DiffusionTrainer:
         # V_k^T V_k -> (batch, k, k)
         gram = torch.bmm(embeddings.transpose(-1, -2), embeddings)
         k = embeddings.shape[-1]
-        identity = torch.eye(k, device=embeddings.device, dtype=embeddings.dtype).unsqueeze(0)
+        identity = torch.eye(
+            k, device=embeddings.device, dtype=embeddings.dtype
+        ).unsqueeze(0)
         return ((gram - identity) ** 2).mean()
 
     def p_sample(
@@ -964,7 +976,7 @@ class DiffusionTrainer:
             atom_mask: Optional atom mask
             spectrum_mask: Optional spectrum mask
             precursor_mz: Optional precursor m/z values, shape (batch,)
-            
+
         Note:
             When ``n_atoms`` is None, this relies on a trained atom-count head
             (`enable_atom_count_head=True`) to provide reasonable predictions.
@@ -984,12 +996,9 @@ class DiffusionTrainer:
             ).long()
             n_atoms = int(n_atoms_per_sample.max().item())
             if atom_mask is None:
-                atom_mask = (
-                    torch.arange(n_atoms, device=self.device)
-                    .unsqueeze(0)
-                    .expand(batch_size, -1)
-                    < n_atoms_per_sample.unsqueeze(1)
-                )
+                atom_mask = torch.arange(n_atoms, device=self.device).unsqueeze(
+                    0
+                ).expand(batch_size, -1) < n_atoms_per_sample.unsqueeze(1)
 
         if n_atoms > self.model.max_atoms:
             raise ValueError(
@@ -1054,7 +1063,9 @@ class DiffusionTrainer:
 
         # Compute loss (only on valid atoms if mask provided)
         noise_loss = self._masked_mse(
-            predicted_noise, noise, mask=atom_mask.unsqueeze(-1) if atom_mask is not None else None
+            predicted_noise,
+            noise,
+            mask=atom_mask.unsqueeze(-1) if atom_mask is not None else None,
         )
 
         loss = noise_loss
@@ -1081,7 +1092,9 @@ class DiffusionTrainer:
             proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
             proj_target = self.projection_from_embeddings(x_0, atom_mask)
             mask_matrix = (
-                None if atom_mask is None else atom_mask.unsqueeze(-1) * atom_mask.unsqueeze(-2)
+                None
+                if atom_mask is None
+                else atom_mask.unsqueeze(-1) * atom_mask.unsqueeze(-2)
             )
             proj_loss = self._masked_mse(proj_pred, proj_target, mask=mask_matrix)
             loss = loss + self.projection_loss_weight * proj_loss
@@ -1095,7 +1108,9 @@ class DiffusionTrainer:
             fp_logits = self.model.predict_fingerprint(
                 mz, intensity, spectrum_mask, precursor_mz
             )
-            fingerprint_loss = F.binary_cross_entropy_with_logits(fp_logits, fingerprint_targets)
+            fingerprint_loss = F.binary_cross_entropy_with_logits(
+                fp_logits, fingerprint_targets
+            )
             loss = loss + self.fingerprint_loss_weight * fingerprint_loss
 
         if self.atom_count_loss_weight > 0 and atom_count_targets is not None:
@@ -1254,7 +1269,7 @@ class SpectralGraphNeuralOperator(nn.Module):
         Returns:
             Symmetric adjacency logits, shape (batch, n_atoms, n_atoms)
         """
-        batch_size, n_atoms, k = embeddings.shape
+        _, n_atoms, _ = embeddings.shape
 
         # Compute all pairwise concatenations [E_i ; E_j]
         # Expand to (batch, n_atoms, n_atoms, k) for both i and j
@@ -1321,9 +1336,7 @@ class DenseGNNLayer(nn.Module):
         self.linear = nn.Linear(in_features, out_features)
         self.norm = nn.LayerNorm(out_features)
 
-    def forward(
-        self, x: torch.Tensor, adj: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of dense GNN layer.
 
@@ -1370,9 +1383,9 @@ class DenseGNNDiscriminator(nn.Module):
         super().__init__()
         self.node_proj = nn.Linear(node_features, hidden_dim)
 
-        self.gnn_layers = nn.ModuleList([
-            DenseGNNLayer(hidden_dim, hidden_dim) for _ in range(num_layers)
-        ])
+        self.gnn_layers = nn.ModuleList(
+            [DenseGNNLayer(hidden_dim, hidden_dim) for _ in range(num_layers)]
+        )
 
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -1466,9 +1479,7 @@ class GuidedDiffusionSampler:
         x_t = torch.randn(batch_size, n_atoms, k, device=device)
 
         for t in reversed(range(self.trainer.n_timesteps)):
-            t_tensor = torch.full(
-                (batch_size,), t, device=device, dtype=torch.long
-            )
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
 
             # Predict noise (standard reverse step)
             with torch.no_grad():
@@ -1518,7 +1529,9 @@ class GuidedDiffusionSampler:
                 # Decode to adjacency and score validity
                 adj_probs = self.sgno.bond_probabilities(x0_hat)
                 if atom_mask is not None:
-                    edge_mask = atom_mask.to(device=adj_probs.device, dtype=adj_probs.dtype)
+                    edge_mask = atom_mask.to(
+                        device=adj_probs.device, dtype=adj_probs.dtype
+                    )
                     edge_mask = edge_mask.unsqueeze(-1) * edge_mask.unsqueeze(-2)
                     adj_probs = adj_probs * edge_mask
                 validity_log_prob = F.logsigmoid(self.discriminator(adj_probs))
@@ -1582,7 +1595,9 @@ class ValencyDecoder:
             valency_table: Mapping from element symbols to maximum valency
             default_valency: Default valency for unknown elements
         """
-        self.valency_table = valency_table if valency_table is not None else VALENCY_TABLE
+        self.valency_table = (
+            valency_table if valency_table is not None else VALENCY_TABLE
+        )
         self.default_valency = default_valency
 
     def get_valency(self, atom_type: str) -> int:
@@ -1631,7 +1646,9 @@ class ValencyDecoder:
 
         # Greedy assignment respecting valency
         for prob, i, j in candidates:
-            feasible_order = min(remaining_valency[i], remaining_valency[j], max_bond_order)
+            feasible_order = min(
+                remaining_valency[i], remaining_valency[j], max_bond_order
+            )
             if feasible_order > 0:
                 adjacency[i, j] = feasible_order
                 adjacency[j, i] = feasible_order
@@ -1760,7 +1777,7 @@ class EigenvalueConditionedSGNO(nn.Module):
         Returns:
             Symmetric adjacency logits, shape (batch, n_atoms, n_atoms)
         """
-        batch_size, n_atoms, k = embeddings.shape
+        _, n_atoms, _ = embeddings.shape
 
         # Encode eigenvalues
         eig_cond = self.eigenvalue_encoder(eigenvalues)  # (batch, eigenvalue_dim)
@@ -1768,8 +1785,8 @@ class EigenvalueConditionedSGNO(nn.Module):
         # Expand for pairwise computation
         e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
         e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
-        eig_expanded = eig_cond.unsqueeze(1).unsqueeze(1).expand(
-            -1, n_atoms, n_atoms, -1
+        eig_expanded = (
+            eig_cond.unsqueeze(1).unsqueeze(1).expand(-1, n_atoms, n_atoms, -1)
         )
         pairs = torch.cat([e_i, e_j, eig_expanded], dim=-1)
 
@@ -1790,7 +1807,7 @@ def create_synthetic_demo_dataset(
 ) -> Tuple[torch.Tensor, ...]:
     """
     Create a small synthetic dataset with padding, masks, and fingerprints.
- 
+
     Returns:
         Tuple of (eigenvectors, mz_values, intensities, atom_mask, spectrum_mask, fingerprints, atom_counts)
     """
@@ -1818,7 +1835,9 @@ def create_synthetic_demo_dataset(
         eig = processor.process_smiles(smiles)
         eigen_list.append(eig)
         atom_counts.append(eig.shape[0])
-        fingerprints.append(processor.smiles_to_fingerprint(smiles, n_bits=fingerprint_bits))
+        fingerprints.append(
+            processor.smiles_to_fingerprint(smiles, n_bits=fingerprint_bits)
+        )
         max_atoms = max(max_atoms, eig.shape[0])
 
         low = 6
@@ -1884,7 +1903,9 @@ def run_demo():
         spectrum_mask,
         fp_targets,
         atom_counts,
-    ) = create_synthetic_demo_dataset(batch_size=32, k=8, max_peaks=40, fingerprint_bits=128)
+    ) = create_synthetic_demo_dataset(
+        batch_size=32, k=8, max_peaks=40, fingerprint_bits=128
+    )
     x_0, mz, intensity, atom_mask, spectrum_mask, fp_targets, atom_counts = (
         x_0.to(device),
         mz.to(device),
@@ -1896,7 +1917,9 @@ def run_demo():
     )
     print(f"   Eigenvector batch shape (with padding): {x_0.shape}")
     print(f"   Spectrum batch shape (with padding): {mz.shape}")
-    print(f"   Example atom_mask valid atoms: {int(atom_mask[0].sum().item())}/{atom_mask.shape[1]}")
+    print(
+        f"   Example atom_mask valid atoms: {int(atom_mask[0].sum().item())}/{atom_mask.shape[1]}"
+    )
     print(
         f"   Example spectrum_mask valid peaks: {int(spectrum_mask[0].sum().item())}/{spectrum_mask.shape[1]}"
     )
