@@ -87,6 +87,10 @@ class SpectralDataProcessor:
             raise ValueError(f"Invalid SMILES: {smiles}")
 
         num_atoms = mol.GetNumAtoms()
+        if num_atoms == 0:
+            raise ValueError(
+                f"SMILES {smiles} resulted in 0 atoms after adding Hs."
+            )
         adjacency = np.zeros((num_atoms, num_atoms), dtype=np.float32)
 
         for bond in mol.GetBonds():

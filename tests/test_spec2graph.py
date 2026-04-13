@@ -762,3 +762,10 @@ class TestEndToEndPipeline:
             "noise", "projection", "orthonormality", "fingerprint", "atom_count",
             "eigenvalue"
         ])
+
+def test_process_smiles_zero_atoms():
+    from spectral_diffusion import SpectralDataProcessor
+    import pytest
+    processor = SpectralDataProcessor()
+    with pytest.raises(ValueError, match="resulted in 0 atoms after adding Hs"):
+        processor.process_smiles("")
