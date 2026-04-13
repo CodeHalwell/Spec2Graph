@@ -84,6 +84,20 @@ def test_forward_raises_when_atoms_exceed_max():
         model(x_t, t, mz, intensity)
 
 
+
+def test_forward_raises_when_mask_length_invalid():
+    """Verify that an atom mask with length != max_atoms raises a ValueError."""
+    model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4)
+    # x_t length matches max_atoms, but atom_mask has length 5
+    x_t = torch.randn(1, 4, 2)
+    t = torch.zeros(1, dtype=torch.long)
+    mz = torch.zeros(1, 4)
+    intensity = torch.zeros(1, 4)
+    atom_mask = torch.ones(1, 5, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="atom_mask must have shape"):
+        model(x_t, t, mz, intensity, atom_mask=atom_mask)
+
 def test_q_sample_reconstruct_is_stable():
     model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4)
     trainer = DiffusionTrainer(model, n_timesteps=5)
