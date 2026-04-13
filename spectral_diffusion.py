@@ -1390,7 +1390,7 @@ class DenseGNNDiscriminator(nn.Module):
         Returns:
             Validity scores, shape (batch, 1)
         """
-        batch_size, n_atoms, _ = adj_probs.shape
+        _, n_atoms, _ = adj_probs.shape
 
         # Use node degree as initial features
         degree = adj_probs.sum(dim=-1, keepdim=True)  # (batch, n_atoms, 1)
