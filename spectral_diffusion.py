@@ -1254,7 +1254,7 @@ class SpectralGraphNeuralOperator(nn.Module):
         Returns:
             Symmetric adjacency logits, shape (batch, n_atoms, n_atoms)
         """
-        batch_size, n_atoms, k = embeddings.shape
+        _, n_atoms, _ = embeddings.shape
 
         # Compute all pairwise concatenations [E_i ; E_j]
         # Expand to (batch, n_atoms, n_atoms, k) for both i and j
@@ -1760,7 +1760,7 @@ class EigenvalueConditionedSGNO(nn.Module):
         Returns:
             Symmetric adjacency logits, shape (batch, n_atoms, n_atoms)
         """
-        batch_size, n_atoms, k = embeddings.shape
+        _, n_atoms, _ = embeddings.shape
 
         # Encode eigenvalues
         eig_cond = self.eigenvalue_encoder(eigenvalues)  # (batch, eigenvalue_dim)
