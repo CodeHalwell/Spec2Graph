@@ -953,6 +953,7 @@ class DiffusionTrainer:
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
+        x_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Generate eigenvectors by reverse diffusion.
@@ -996,8 +997,12 @@ class DiffusionTrainer:
                 f"Requested n_atoms ({n_atoms}) exceeds model.max_atoms ({self.model.max_atoms})."
             )
 
-        # Start from pure noise
-        x_t = torch.randn(batch_size, n_atoms, k, device=self.device)
+        if x_t is not None:
+            if x_t.shape != (batch_size, n_atoms, k):
+                raise ValueError(f"Expected x_t shape {(batch_size, n_atoms, k)}, but got {x_t.shape}")
+        else:
+            # Start from pure noise
+            x_t = torch.randn(batch_size, n_atoms, k, device=self.device)
 
         # Reverse diffusion
         for t in reversed(range(self.n_timesteps)):
