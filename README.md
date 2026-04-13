@@ -103,7 +103,9 @@ x_0 = torch.tensor(eigenvectors).unsqueeze(0).to(device)
 
 # Training step
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-loss = trainer.train_step(optimizer, x_0, mz, intensity)
+from spectral_diffusion import TrainingBatch
+batch = TrainingBatch(x_0=x_0, mz=mz, intensity=intensity)
+loss = trainer.train_step(optimizer, batch)
 print(f"Loss: {loss}")
 
 # Generate new eigenvectors

@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Union
 import warnings
 
@@ -691,6 +692,19 @@ class Spec2GraphDiffusion(nn.Module):
         return self.eigenvalue_head(pooled)
 
 
+@dataclass
+class TrainingBatch:
+    x_0: torch.Tensor
+    mz: torch.Tensor
+    intensity: torch.Tensor
+    atom_mask: Optional[torch.Tensor] = None
+    spectrum_mask: Optional[torch.Tensor] = None
+    precursor_mz: Optional[torch.Tensor] = None
+    fingerprint_targets: Optional[torch.Tensor] = None
+    atom_count_targets: Optional[torch.Tensor] = None
+    eigenvalue_targets: Optional[torch.Tensor] = None
+
+
 class DiffusionTrainer:
     """Training and sampling utilities for DDPM diffusion."""
 
@@ -1009,52 +1023,36 @@ class DiffusionTrainer:
 
     def compute_loss(
         self,
-        x_0: torch.Tensor,
-        mz: torch.Tensor,
-        intensity: torch.Tensor,
-        atom_mask: Optional[torch.Tensor] = None,
-        spectrum_mask: Optional[torch.Tensor] = None,
-        precursor_mz: Optional[torch.Tensor] = None,
-        fingerprint_targets: Optional[torch.Tensor] = None,
-        atom_count_targets: Optional[torch.Tensor] = None,
-        eigenvalue_targets: Optional[torch.Tensor] = None,
+        batch: TrainingBatch,
         return_components: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         """
         Compute training loss.
 
         Args:
-            x_0: Clean eigenvectors, shape (batch, n_atoms, k)
-            mz: m/z values, shape (batch, n_peaks)
-            intensity: Intensity values, shape (batch, n_peaks)
-            atom_mask: Optional atom mask
-            spectrum_mask: Optional spectrum mask
-            precursor_mz: Optional precursor m/z values
-            fingerprint_targets: Optional fingerprint labels for auxiliary loss
-            atom_count_targets: Optional atom-count labels for auxiliary loss
-            eigenvalue_targets: Optional eigenvalue labels for Phase 4 auxiliary loss
+            batch: TrainingBatch containing all input data
             return_components: If True, also return component losses
 
         Returns:
             MSE loss
         """
-        batch_size = x_0.shape[0]
+        batch_size = batch.x_0.shape[0]
 
         # Sample random timesteps
         t = torch.randint(0, self.n_timesteps, (batch_size,), device=self.device)
 
         # Add noise
-        noise = torch.randn_like(x_0)
-        x_t, _ = self.q_sample(x_0, t, noise)
+        noise = torch.randn_like(batch.x_0)
+        x_t, _ = self.q_sample(batch.x_0, t, noise)
 
         # Predict noise
         predicted_noise = self.model(
-            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+            x_t, t, batch.mz, batch.intensity, batch.atom_mask, batch.spectrum_mask, batch.precursor_mz
         )
 
         # Compute loss (only on valid atoms if mask provided)
         noise_loss = self._masked_mse(
-            predicted_noise, noise, mask=atom_mask.unsqueeze(-1) if atom_mask is not None else None
+            predicted_noise, noise, mask=batch.atom_mask.unsqueeze(-1) if batch.atom_mask is not None else None
         )
 
         loss = noise_loss
@@ -1064,7 +1062,7 @@ class DiffusionTrainer:
         atom_count_loss = torch.tensor(0.0, device=self.device)
         eigenvalue_loss = torch.tensor(0.0, device=self.device)
 
-        # Reconstruct x_0 for projection and orthonormality losses
+        # Reconstruct batch.x_0 for projection and orthonormality losses
         x_0_pred = None
         if self.projection_loss_weight > 0 or self.orthonormality_loss_weight > 0:
             sqrt_alpha = self.sqrt_alpha_cumprod_clamped[t].view(batch_size, 1, 1)
@@ -1078,39 +1076,39 @@ class DiffusionTrainer:
 
         # Subspace-invariant projection loss to mitigate eigenvector sign/rotation ambiguity
         if self.projection_loss_weight > 0 and x_0_pred is not None:
-            proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
-            proj_target = self.projection_from_embeddings(x_0, atom_mask)
+            proj_pred = self.projection_from_embeddings(x_0_pred, batch.atom_mask)
+            proj_target = self.projection_from_embeddings(batch.x_0, batch.atom_mask)
             mask_matrix = (
-                None if atom_mask is None else atom_mask.unsqueeze(-1) * atom_mask.unsqueeze(-2)
+                None if batch.atom_mask is None else batch.atom_mask.unsqueeze(-1) * batch.atom_mask.unsqueeze(-2)
             )
             proj_loss = self._masked_mse(proj_pred, proj_target, mask=mask_matrix)
             loss = loss + self.projection_loss_weight * proj_loss
 
         # Orthonormality regulariser: ||V_k^T V_k - I_k||_F^2
         if self.orthonormality_loss_weight > 0 and x_0_pred is not None:
-            ortho_loss = self._orthonormality_loss(x_0_pred, atom_mask)
+            ortho_loss = self._orthonormality_loss(x_0_pred, batch.atom_mask)
             loss = loss + self.orthonormality_loss_weight * ortho_loss
 
-        if self.fingerprint_loss_weight > 0 and fingerprint_targets is not None:
+        if self.fingerprint_loss_weight > 0 and batch.fingerprint_targets is not None:
             fp_logits = self.model.predict_fingerprint(
-                mz, intensity, spectrum_mask, precursor_mz
+                batch.mz, batch.intensity, batch.spectrum_mask, batch.precursor_mz
             )
-            fingerprint_loss = F.binary_cross_entropy_with_logits(fp_logits, fingerprint_targets)
+            fingerprint_loss = F.binary_cross_entropy_with_logits(fp_logits, batch.fingerprint_targets)
             loss = loss + self.fingerprint_loss_weight * fingerprint_loss
 
-        if self.atom_count_loss_weight > 0 and atom_count_targets is not None:
+        if self.atom_count_loss_weight > 0 and batch.atom_count_targets is not None:
             atom_pred = self.model.predict_atom_count(
-                mz, intensity, spectrum_mask, precursor_mz
+                batch.mz, batch.intensity, batch.spectrum_mask, batch.precursor_mz
             )
-            atom_count_loss = F.mse_loss(atom_pred, atom_count_targets.float())
+            atom_count_loss = F.mse_loss(atom_pred, batch.atom_count_targets.float())
             loss = loss + self.atom_count_loss_weight * atom_count_loss
 
         # Phase 4: Eigenvalue prediction loss
-        if self.eigenvalue_loss_weight > 0 and eigenvalue_targets is not None:
+        if self.eigenvalue_loss_weight > 0 and batch.eigenvalue_targets is not None:
             eigenvalue_pred = self.model.predict_eigenvalues(
-                mz, intensity, spectrum_mask, precursor_mz
+                batch.mz, batch.intensity, batch.spectrum_mask, batch.precursor_mz
             )
-            eigenvalue_loss = F.mse_loss(eigenvalue_pred, eigenvalue_targets)
+            eigenvalue_loss = F.mse_loss(eigenvalue_pred, batch.eigenvalue_targets)
             loss = loss + self.eigenvalue_loss_weight * eigenvalue_loss
 
         if return_components:
@@ -1128,15 +1126,7 @@ class DiffusionTrainer:
     def train_step(
         self,
         optimizer: torch.optim.Optimizer,
-        x_0: torch.Tensor,
-        mz: torch.Tensor,
-        intensity: torch.Tensor,
-        atom_mask: Optional[torch.Tensor] = None,
-        spectrum_mask: Optional[torch.Tensor] = None,
-        precursor_mz: Optional[torch.Tensor] = None,
-        fingerprint_targets: Optional[torch.Tensor] = None,
-        atom_count_targets: Optional[torch.Tensor] = None,
-        eigenvalue_targets: Optional[torch.Tensor] = None,
+        batch: TrainingBatch,
         return_components: bool = False,
     ) -> Union[float, Tuple[float, dict]]:
         """
@@ -1144,15 +1134,7 @@ class DiffusionTrainer:
 
         Args:
             optimizer: Optimizer
-            x_0: Clean eigenvectors
-            mz: m/z values
-            intensity: Intensity values
-            atom_mask: Optional atom mask
-            spectrum_mask: Optional spectrum mask
-            precursor_mz: Optional precursor m/z values
-            fingerprint_targets: Optional fingerprint labels
-            atom_count_targets: Optional atom-count labels
-            eigenvalue_targets: Optional eigenvalue labels for Phase 4 loss
+            batch: TrainingBatch containing all input data
             return_components: If True, also return component losses
 
         Returns:
@@ -1163,29 +1145,13 @@ class DiffusionTrainer:
 
         loss, components = (
             self.compute_loss(
-                x_0,
-                mz,
-                intensity,
-                atom_mask,
-                spectrum_mask,
-                precursor_mz,
-                fingerprint_targets,
-                atom_count_targets,
-                eigenvalue_targets,
+                batch,
                 return_components=True,
             )
             if return_components
             else (
                 self.compute_loss(
-                    x_0,
-                    mz,
-                    intensity,
-                    atom_mask,
-                    spectrum_mask,
-                    precursor_mz,
-                    fingerprint_targets,
-                    atom_count_targets,
-                    eigenvalue_targets,
+                    batch,
                     return_components=False,
                 ),
                 None,
@@ -1937,15 +1903,18 @@ def run_demo():
 
     n_steps = 20
     for step in range(n_steps):
-        loss, components = trainer.train_step(
-            optimizer,
-            x_0,
-            mz,
-            intensity,
+        batch = TrainingBatch(
+            x_0=x_0,
+            mz=mz,
+            intensity=intensity,
             atom_mask=atom_mask,
             spectrum_mask=spectrum_mask,
             fingerprint_targets=fp_targets,
             atom_count_targets=atom_counts,
+        )
+        loss, components = trainer.train_step(
+            optimizer,
+            batch,
             return_components=True,
         )
         if (step + 1) % 5 == 0:
