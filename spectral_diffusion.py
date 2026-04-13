@@ -1256,14 +1256,24 @@ class SpectralGraphNeuralOperator(nn.Module):
         """
         batch_size, n_atoms, k = embeddings.shape
 
-        # Compute all pairwise concatenations [E_i ; E_j]
-        # Expand to (batch, n_atoms, n_atoms, k) for both i and j
-        e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
-        e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
-        pairs = torch.cat([e_i, e_j], dim=-1)  # (batch, n_atoms, n_atoms, 2k)
+        # Performance optimization: Apply linear layer using broadcasting
+        # instead of expanding to a huge O(N^2 * 2K) tensor
+        first_layer = self.pairwise_mlp[0]
+        W = first_layer.weight
+        b = first_layer.bias
 
-        # Pass through pairwise MLP
-        logits = self.pairwise_mlp(pairs).squeeze(-1)  # (batch, n_atoms, n_atoms)
+        W_i = W[:, :k]
+        W_j = W[:, k:]
+
+        x_i = torch.matmul(embeddings, W_i.t())
+        x_j = torch.matmul(embeddings, W_j.t())
+
+        x = x_i.unsqueeze(2) + x_j.unsqueeze(1) + b
+
+        for i in range(1, len(self.pairwise_mlp)):
+            x = self.pairwise_mlp[i](x)
+
+        logits = x.squeeze(-1)  # (batch, n_atoms, n_atoms)
 
         # Enforce symmetry: A = (A + A^T) / 2
         logits = 0.5 * (logits + logits.transpose(-1, -2))
@@ -1765,15 +1775,27 @@ class EigenvalueConditionedSGNO(nn.Module):
         # Encode eigenvalues
         eig_cond = self.eigenvalue_encoder(eigenvalues)  # (batch, eigenvalue_dim)
 
-        # Expand for pairwise computation
-        e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
-        e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
-        eig_expanded = eig_cond.unsqueeze(1).unsqueeze(1).expand(
-            -1, n_atoms, n_atoms, -1
-        )
-        pairs = torch.cat([e_i, e_j, eig_expanded], dim=-1)
+        # Performance optimization: Apply linear layer using broadcasting
+        # instead of expanding to a huge tensor
+        first_layer = self.pairwise_mlp[0]
+        W = first_layer.weight
+        b = first_layer.bias
 
-        logits = self.pairwise_mlp(pairs).squeeze(-1)
+        k = self.k
+        W_i = W[:, :k]
+        W_j = W[:, k:2*k]
+        W_eig = W[:, 2*k:]
+
+        x_i = torch.matmul(embeddings, W_i.t())
+        x_j = torch.matmul(embeddings, W_j.t())
+        x_eig = torch.matmul(eig_cond, W_eig.t())
+
+        x = x_i.unsqueeze(2) + x_j.unsqueeze(1) + x_eig.unsqueeze(1).unsqueeze(2) + b
+
+        for i in range(1, len(self.pairwise_mlp)):
+            x = self.pairwise_mlp[i](x)
+
+        logits = x.squeeze(-1)
         logits = 0.5 * (logits + logits.transpose(-1, -2))
 
         return logits
