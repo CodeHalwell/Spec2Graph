@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from spectral_diffusion import (
+    TrainerConfig,
     DiffusionTrainer,
     SpectralDataProcessor,
     Spec2GraphDiffusion,
@@ -86,7 +87,7 @@ def test_forward_raises_when_atoms_exceed_max():
 
 def test_q_sample_reconstruct_is_stable():
     model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4)
-    trainer = DiffusionTrainer(model, n_timesteps=5)
+    trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=5))
     x0 = torch.randn(1, 4, 2)
     t = torch.tensor([1])
     x_t, noise = trainer.q_sample(x0, t)
@@ -186,7 +187,7 @@ class TestSpectralGraphNeuralOperator:
 class TestOrthonormalityLoss:
     def test_default_orthonormality_weight_is_backward_compatible(self):
         model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4)
-        trainer = DiffusionTrainer(model, n_timesteps=5)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=5))
         assert trainer.orthonormality_loss_weight == 0.0
 
     def test_orthonormal_input_gives_near_zero_loss(self):
@@ -215,7 +216,7 @@ class TestOrthonormalityLoss:
     def test_orthonormality_loss_integrated_in_compute_loss(self):
         """Verify orthonormality loss appears in compute_loss components."""
         model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4)
-        trainer = DiffusionTrainer(model, n_timesteps=5, orthonormality_loss_weight=1.0)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=5, orthonormality_loss_weight=1.0))
         x_0 = torch.randn(2, 4, 2)
         mz = torch.randn(2, 4)
         intensity = torch.randn(2, 4)
@@ -227,7 +228,7 @@ class TestOrthonormalityLoss:
     def test_zero_orthonormality_weight_skips_computation(self):
         """When weight is 0, orthonormality loss should be 0."""
         model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4)
-        trainer = DiffusionTrainer(model, n_timesteps=5, orthonormality_loss_weight=0.0)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=5, orthonormality_loss_weight=0.0))
         x_0 = torch.randn(2, 4, 2)
         mz = torch.randn(2, 4)
         intensity = torch.randn(2, 4)
@@ -301,7 +302,7 @@ class TestPrecursorConditioning:
             enable_precursor_conditioning=True
         )
         model.eval()
-        trainer = DiffusionTrainer(model, n_timesteps=5)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=5))
         x_0 = torch.randn(1, 4, 2)
         mz = torch.randn(1, 4)
         intensity = torch.randn(1, 4)
@@ -330,7 +331,7 @@ class TestPrecursorConditioning:
             enable_precursor_conditioning=True
         )
         model.eval()
-        trainer = DiffusionTrainer(model, n_timesteps=3)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=3))
         mz = torch.randn(1, 4)
         intensity = torch.randn(1, 4)
 
@@ -401,7 +402,7 @@ class TestGuidedDiffusionSampler:
             k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1
         )
-        trainer = DiffusionTrainer(model, n_timesteps=3)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=3))
         sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=16, num_layers=2)
         disc = DenseGNNDiscriminator(node_features=1, hidden_dim=16, num_layers=2)
         return GuidedDiffusionSampler(trainer, sgno, disc, guidance_scale=0.1)
@@ -427,7 +428,7 @@ class TestGuidedDiffusionSampler:
             k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1
         )
-        trainer = DiffusionTrainer(model, n_timesteps=3)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=3))
         sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=16, num_layers=2)
         disc = DenseGNNDiscriminator(node_features=1, hidden_dim=16, num_layers=2)
 
@@ -452,7 +453,7 @@ class TestGuidedDiffusionSampler:
             k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1
         )
-        trainer = DiffusionTrainer(model, n_timesteps=3)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=3))
         sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=16, num_layers=2)
         disc = DenseGNNDiscriminator(node_features=1, hidden_dim=16, num_layers=2)
         sampler = GuidedDiffusionSampler(trainer, sgno, disc, guidance_scale=0.0)
@@ -491,7 +492,7 @@ class TestGuidedDiffusionSampler:
             k=2, max_atoms=4, max_peaks=4, d_model=32, nhead=4,
             num_encoder_layers=1, num_decoder_layers=1
         )
-        trainer = DiffusionTrainer(model, n_timesteps=3)
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=3))
         sgno = RecordingSGNO()
         disc = RecordingDiscriminator()
         sampler = GuidedDiffusionSampler(trainer, sgno, disc, guidance_scale=0.5)
@@ -677,9 +678,7 @@ class TestEigenvalueConditioning:
             num_encoder_layers=1, num_decoder_layers=1,
             enable_eigenvalue_head=True
         )
-        trainer = DiffusionTrainer(
-            model, n_timesteps=5, eigenvalue_loss_weight=1.0
-        )
+        trainer = DiffusionTrainer(model, TrainerConfig(n_timesteps=5, eigenvalue_loss_weight=1.0))
         x_0 = torch.randn(2, 4, 2)
         mz = torch.randn(2, 4)
         intensity = torch.randn(2, 4)
@@ -733,14 +732,15 @@ class TestEndToEndPipeline:
             fingerprint_dim=16, enable_atom_count_head=True,
             enable_eigenvalue_head=True
         )
-        trainer = DiffusionTrainer(
-            model, n_timesteps=5,
+        config = TrainerConfig(
+            n_timesteps=5,
             projection_loss_weight=1.0,
             orthonormality_loss_weight=0.1,
             fingerprint_loss_weight=0.1,
             atom_count_loss_weight=0.05,
             eigenvalue_loss_weight=0.1,
         )
+        trainer = DiffusionTrainer(model, config)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
         x_0 = torch.randn(2, 4, 2)

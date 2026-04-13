@@ -73,7 +73,8 @@ This will:
 from spectral_diffusion import (
     SpectralDataProcessor,
     Spec2GraphDiffusion,
-    DiffusionTrainer
+    DiffusionTrainer,
+    TrainerConfig
 )
 import torch
 import numpy as np
@@ -94,7 +95,8 @@ model = Spec2GraphDiffusion(
 # Create trainer
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
-trainer = DiffusionTrainer(model=model, n_timesteps=1000, device=device)
+config = TrainerConfig(n_timesteps=1000)
+trainer = DiffusionTrainer(model=model, config=config, device=device)
 
 # Prepare spectrum data (example)
 mz = torch.tensor([[39.0, 51.0, 77.0, 78.0]]).to(device)
@@ -254,13 +256,16 @@ model = Spec2GraphDiffusion(
 ### DiffusionTrainer
 
 ```python
-trainer = DiffusionTrainer(
-    model=model,
+config = TrainerConfig(
     n_timesteps=1000,
     beta_start=0.0001,
     beta_end=0.02,
-    device="cuda",
     projection_loss_weight=1.0,  # subspace-invariant P_k supervision
+)
+trainer = DiffusionTrainer(
+    model=model,
+    config=config,
+    device="cuda",
 )
 ```
 
