@@ -762,3 +762,9 @@ class TestEndToEndPipeline:
             "noise", "projection", "orthonormality", "fingerprint", "atom_count",
             "eigenvalue"
         ])
+
+def test_projection_matrix_raises_when_k_exceeds_eigenvectors():
+    processor = SpectralDataProcessor(k=8)
+    eigenvectors = np.random.rand(5, 4)
+    with pytest.raises(ValueError, match="Requested k=8 but only 4 eigenvectors available."):
+        processor.projection_matrix(eigenvectors)
