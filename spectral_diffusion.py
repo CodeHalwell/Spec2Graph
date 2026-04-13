@@ -574,7 +574,7 @@ class Spec2GraphDiffusion(nn.Module):
         Returns:
             Predicted noise, shape (batch, n_atoms, k)
         """
-        batch_size, n_atoms, _ = x_t.shape
+        _, n_atoms, _ = x_t.shape
 
         if n_atoms > self.max_atoms:
             raise ValueError(
