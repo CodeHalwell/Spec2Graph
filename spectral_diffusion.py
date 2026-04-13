@@ -1760,7 +1760,7 @@ class EigenvalueConditionedSGNO(nn.Module):
         Returns:
             Symmetric adjacency logits, shape (batch, n_atoms, n_atoms)
         """
-        batch_size, n_atoms, k = embeddings.shape
+        batch_size, n_atoms, _ = embeddings.shape
 
         # Encode eigenvalues
         eig_cond = self.eigenvalue_encoder(eigenvalues)  # (batch, eigenvalue_dim)
