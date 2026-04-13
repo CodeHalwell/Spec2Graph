@@ -698,6 +698,24 @@ class TestEigenvalueConditioning:
 # ==============================================================================
 
 
+
+def test_process_smiles_returns_correct_shape_and_projection():
+    """Test that process_smiles returns eigenvectors and optionally projection matrix of correct shapes."""
+    processor = SpectralDataProcessor(k=2)
+    smiles = "CCO"  # ethanol: 3 atoms
+
+    # Test without return_projection
+    eigenvectors = processor.process_smiles(smiles)
+    assert isinstance(eigenvectors, np.ndarray)
+    assert eigenvectors.shape == (3, 2)
+
+    # Test with return_projection
+    eigenvectors, projection = processor.process_smiles(smiles, return_projection=True)
+    assert isinstance(eigenvectors, np.ndarray)
+    assert isinstance(projection, np.ndarray)
+    assert eigenvectors.shape == (3, 2)
+    assert projection.shape == (3, 3)
+
 class TestEndToEndPipeline:
     def test_full_pipeline_sgno_decode(self):
         """Test SMILES -> eigenvectors -> SGNO -> adjacency pipeline."""
