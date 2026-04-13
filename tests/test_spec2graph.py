@@ -762,3 +762,29 @@ class TestEndToEndPipeline:
             "noise", "projection", "orthonormality", "fingerprint", "atom_count",
             "eigenvalue"
         ])
+
+class TestSpectralDataProcessor:
+    def test_smiles_to_fingerprint_valid(self):
+        """Valid SMILES should return a binary numpy array of expected length."""
+        processor = SpectralDataProcessor()
+        fp = processor.smiles_to_fingerprint("CCO", n_bits=256)
+
+        assert isinstance(fp, np.ndarray)
+        assert fp.dtype == np.float32
+        assert fp.shape == (256,)
+        # All values should be 0.0 or 1.0
+        assert np.all(np.isin(fp, [0.0, 1.0]))
+        # There should be some non-zero bits for CCO
+        assert np.sum(fp) > 0
+
+    def test_smiles_to_fingerprint_default_length(self):
+        """Test default n_bits (which is 2048 in current implementation)."""
+        processor = SpectralDataProcessor()
+        fp = processor.smiles_to_fingerprint("CCO")
+        assert fp.shape == (2048,)
+
+    def test_smiles_to_fingerprint_invalid_smiles(self):
+        """Invalid SMILES should raise ValueError."""
+        processor = SpectralDataProcessor()
+        with pytest.raises(ValueError, match="Invalid SMILES:"):
+            processor.smiles_to_fingerprint("invalid_smiles_string")
