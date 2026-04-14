@@ -1256,14 +1256,28 @@ class SpectralGraphNeuralOperator(nn.Module):
         """
         batch_size, n_atoms, k = embeddings.shape
 
-        # Compute all pairwise concatenations [E_i ; E_j]
-        # Expand to (batch, n_atoms, n_atoms, k) for both i and j
-        e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
-        e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
-        pairs = torch.cat([e_i, e_j], dim=-1)  # (batch, n_atoms, n_atoms, 2k)
+        # Optimization: avoid O(N^2) concatenation and first linear layer
+        linear1 = self.pairwise_mlp[0]
 
-        # Pass through pairwise MLP
-        logits = self.pairwise_mlp(pairs).squeeze(-1)  # (batch, n_atoms, n_atoms)
+        # The input is concatenated as [e_i, e_j]
+        # Dimensions: k, k
+        W_i = linear1.weight[:, :k]
+        W_j = linear1.weight[:, k:]
+
+        # Apply linear transformations individually
+        h_i = F.linear(embeddings, W_i, linear1.bias)  # (batch, n_atoms, hidden_dim)
+        h_j = F.linear(embeddings, W_j)                # (batch, n_atoms, hidden_dim)
+
+        # Combine with broadcasting
+        # h_i: (batch, n_atoms, 1, hidden_dim)
+        # h_j: (batch, 1, n_atoms, hidden_dim)
+        h = h_i.unsqueeze(2) + h_j.unsqueeze(1)
+
+        # Pass through remaining MLP layers
+        for i in range(1, len(self.pairwise_mlp)):
+            h = self.pairwise_mlp[i](h)
+
+        logits = h.squeeze(-1)
 
         # Enforce symmetry: A = (A + A^T) / 2
         logits = 0.5 * (logits + logits.transpose(-1, -2))
@@ -1765,15 +1779,32 @@ class EigenvalueConditionedSGNO(nn.Module):
         # Encode eigenvalues
         eig_cond = self.eigenvalue_encoder(eigenvalues)  # (batch, eigenvalue_dim)
 
-        # Expand for pairwise computation
-        e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
-        e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
-        eig_expanded = eig_cond.unsqueeze(1).unsqueeze(1).expand(
-            -1, n_atoms, n_atoms, -1
-        )
-        pairs = torch.cat([e_i, e_j, eig_expanded], dim=-1)
+        # Optimization: avoid O(N^2) concatenation and first linear layer
+        import torch.nn.functional as F
+        linear1 = self.pairwise_mlp[0]
 
-        logits = self.pairwise_mlp(pairs).squeeze(-1)
+        # The input is concatenated as [e_i, e_j, eig_expanded]
+        # Dimensions: k, k, eigenvalue_dim
+        W_i = linear1.weight[:, :k]
+        W_j = linear1.weight[:, k:2*k]
+        W_eig = linear1.weight[:, 2*k:]
+
+        # Apply linear transformations individually
+        h_i = F.linear(embeddings, W_i, linear1.bias)  # (batch, n_atoms, hidden_dim)
+        h_j = F.linear(embeddings, W_j)                # (batch, n_atoms, hidden_dim)
+        h_eig = F.linear(eig_cond, W_eig)              # (batch, hidden_dim)
+
+        # Combine with broadcasting
+        # h_i: (batch, n_atoms, 1, hidden_dim)
+        # h_j: (batch, 1, n_atoms, hidden_dim)
+        # h_eig: (batch, 1, 1, hidden_dim)
+        h = h_i.unsqueeze(2) + h_j.unsqueeze(1) + h_eig.unsqueeze(1).unsqueeze(2)
+
+        # Pass through remaining MLP layers
+        for i in range(1, len(self.pairwise_mlp)):
+            h = self.pairwise_mlp[i](h)
+
+        logits = h.squeeze(-1)
         logits = 0.5 * (logits + logits.transpose(-1, -2))
 
         return logits

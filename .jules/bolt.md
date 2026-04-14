@@ -1,0 +1,3 @@
+## 2024-04-14 - Avoiding O(N^2) Tensor Materialization in Pairwise MLPs
+**Learning:** In Graph Neural Networks, computing pairwise node interactions often involves concatenating node embeddings `[e_i, e_j]` resulting in a massive O(N^2 * 2K) tensor before passing it to an MLP. This is highly inefficient in terms of memory and compute time.
+**Action:** Instead of materializing the O(N^2) tensor, split the weights of the first linear layer (`W_i` and `W_j`), apply them individually to `e_i` and `e_j` (O(N) operations), and then combine the results using broadcasting. This mathematically equivalent approach significantly reduces peak memory usage and speeds up computation.
