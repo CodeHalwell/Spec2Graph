@@ -1211,7 +1211,7 @@ class SpectralGraphNeuralOperator(nn.Module):
 
     Treats predicted eigenvectors as coordinates on a continuous manifold and
     learns a resolution-invariant kernel to produce adjacency logits via
-    bilinear interactions of node features.
+    pairwise MLP interactions.
     """
 
     def __init__(self, k: int = 8, hidden_dim: int = 128, num_layers: int = 3):
@@ -1226,17 +1226,14 @@ class SpectralGraphNeuralOperator(nn.Module):
         super().__init__()
         self.k = k
 
-        # Apply MLP to node features
         layers: List[nn.Module] = []
-        in_dim = k
+        in_dim = 2 * k  # concatenation of two node embeddings
         for i in range(num_layers - 1):
             out_dim = hidden_dim
             layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU()])
             in_dim = out_dim
-        self.node_mlp = nn.Sequential(*layers)
-
-        # Bilinear decoder for pairwise interactions
-        self.bilinear = nn.Bilinear(hidden_dim, hidden_dim, 1)
+        layers.append(nn.Linear(in_dim, 1))
+        self.pairwise_mlp = nn.Sequential(*layers)
 
     @staticmethod
     def _zero_diagonal(matrix: torch.Tensor) -> torch.Tensor:
@@ -1259,16 +1256,20 @@ class SpectralGraphNeuralOperator(nn.Module):
         """
         batch_size, n_atoms, k = embeddings.shape
 
-        # Apply MLP per-node: O(B * N) instead of O(B * N^2)
-        h = self.node_mlp(embeddings)  # (batch, n_atoms, hidden_dim)
+        first_layer = self.pairwise_mlp[0]
 
-        # Bilinear interaction: e_i^T W e_j + b
-        W = self.bilinear.weight.squeeze(0)  # (hidden_dim, hidden_dim)
-        b = self.bilinear.bias  # (1,)
+        W_i = first_layer.weight[:, :k]
+        W_j = first_layer.weight[:, k:2*k]
 
-        # Compute pairwise interactions efficiently: h @ W @ h^T
-        h_W = torch.matmul(h, W)  # (batch, n_atoms, hidden_dim)
-        logits = torch.matmul(h_W, h.transpose(-1, -2)) + b  # (batch, n_atoms, n_atoms)
+        h_i = F.linear(embeddings, W_i)  # (B, N, H)
+        h_j = F.linear(embeddings, W_j)  # (B, N, H)
+
+        h = h_i.unsqueeze(2) + h_j.unsqueeze(1) + first_layer.bias
+
+        for layer in self.pairwise_mlp[1:]:
+            h = layer(h)
+
+        logits = h.squeeze(-1)
 
         # Enforce symmetry: A = (A + A^T) / 2
         logits = 0.5 * (logits + logits.transpose(-1, -2))
@@ -1717,7 +1718,8 @@ class EigenvalueConditionedSGNO(nn.Module):
     """SGNO decoder conditioned on predicted eigenvalue spectra (Phase 4).
 
     Extends the base SGNO by incorporating eigenvalue conditioning into
-    the node features, constraining the space of valid topologies.
+    the pairwise interaction kernel, constraining the space of valid
+    topologies.
     """
 
     def __init__(
@@ -1740,17 +1742,15 @@ class EigenvalueConditionedSGNO(nn.Module):
         self.k = k
         self.eigenvalue_encoder = EigenvalueConditioner(k, eigenvalue_dim)
 
-        # Apply MLP to node features conditioned on eigenvalues
+        # Pairwise MLP takes [E_i; E_j; eigenvalue_cond]
         layers: List[nn.Module] = []
-        in_dim = k + eigenvalue_dim
+        in_dim = 2 * k + eigenvalue_dim
         for i in range(num_layers - 1):
             out_dim = hidden_dim
             layers.extend([nn.Linear(in_dim, out_dim), nn.ReLU()])
             in_dim = out_dim
-        self.node_mlp = nn.Sequential(*layers)
-
-        # Bilinear decoder for pairwise interactions
-        self.bilinear = nn.Bilinear(hidden_dim, hidden_dim, 1)
+        layers.append(nn.Linear(in_dim, 1))
+        self.pairwise_mlp = nn.Sequential(*layers)
 
     def forward(
         self, embeddings: torch.Tensor, eigenvalues: torch.Tensor
@@ -1770,21 +1770,22 @@ class EigenvalueConditionedSGNO(nn.Module):
         # Encode eigenvalues
         eig_cond = self.eigenvalue_encoder(eigenvalues)  # (batch, eigenvalue_dim)
 
-        # Concatenate eigenvalue conditioning to each node embedding
-        eig_expanded = eig_cond.unsqueeze(1).expand(-1, n_atoms, -1)
-        node_features = torch.cat([embeddings, eig_expanded], dim=-1)
+        first_layer = self.pairwise_mlp[0]
 
-        # Apply MLP per-node: O(B * N) instead of O(B * N^2)
-        h = self.node_mlp(node_features)  # (batch, n_atoms, hidden_dim)
+        W_i = first_layer.weight[:, :k]         # (hidden_dim, k)
+        W_j = first_layer.weight[:, k:2*k]      # (hidden_dim, k)
+        W_eig = first_layer.weight[:, 2*k:]     # (hidden_dim, D)
 
-        # Bilinear interaction: e_i^T W e_j + b
-        W = self.bilinear.weight.squeeze(0)  # (hidden_dim, hidden_dim)
-        b = self.bilinear.bias  # (1,)
+        h_i = F.linear(embeddings, W_i)  # (B, N, hidden_dim)
+        h_j = F.linear(embeddings, W_j)  # (B, N, hidden_dim)
+        h_eig = F.linear(eig_cond, W_eig) # (B, hidden_dim)
 
-        # Compute pairwise interactions efficiently: h @ W @ h^T
-        h_W = torch.matmul(h, W)  # (batch, n_atoms, hidden_dim)
-        logits = torch.matmul(h_W, h.transpose(-1, -2)) + b  # (batch, n_atoms, n_atoms)
+        h = h_i.unsqueeze(2) + h_j.unsqueeze(1) + h_eig.unsqueeze(1).unsqueeze(1) + first_layer.bias
 
+        for layer in self.pairwise_mlp[1:]:
+            h = layer(h)
+
+        logits = h.squeeze(-1)
         logits = 0.5 * (logits + logits.transpose(-1, -2))
 
         return logits
