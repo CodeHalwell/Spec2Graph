@@ -73,8 +73,9 @@ This will:
 from spectral_diffusion import (
     SpectralDataProcessor,
     Spec2GraphDiffusion,
+    Spec2GraphDiffusionConfig,
     DiffusionTrainer,
-    TrainerConfig
+    TrainerConfig,
 )
 import torch
 import numpy as np
@@ -84,13 +85,14 @@ processor = SpectralDataProcessor(k=8)
 eigenvectors = processor.process_smiles("c1ccccc1")  # Benzene
 
 # Create model
-model = Spec2GraphDiffusion(
+config = Spec2GraphDiffusionConfig(
     d_model=256,
     nhead=8,
     num_encoder_layers=4,
     num_decoder_layers=4,
     k=8,
 )
+model = Spec2GraphDiffusion(config)
 
 # Create trainer
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -240,7 +242,7 @@ eigenvectors = processor.process_smiles("CCO")  # Ethanol
 ### Spec2GraphDiffusion
 
 ```python
-model = Spec2GraphDiffusion(
+config = Spec2GraphDiffusionConfig(
     d_model=256,        # Model dimension
     nhead=8,            # Attention heads
     num_encoder_layers=4,
@@ -251,6 +253,7 @@ model = Spec2GraphDiffusion(
     max_peaks=100,
     dropout=0.1,
 )
+model = Spec2GraphDiffusion(config)
 ```
 
 ### DiffusionTrainer
