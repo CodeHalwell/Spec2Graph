@@ -21,6 +21,7 @@ Usage Example:
 """
 
 import math
+from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn as nn
@@ -722,48 +723,51 @@ class TrainingBatch:
     eigenvalue_targets: Optional[torch.Tensor] = None
 
 
+@dataclass
+class TrainerConfig:
+    n_timesteps: int = 1000
+    beta_start: float = 0.0001
+    beta_end: float = 0.02
+    projection_loss_weight: float = 1.0
+    orthonormality_loss_weight: float = 0.0
+    fingerprint_loss_weight: float = 0.0
+    atom_count_loss_weight: float = 0.0
+    eigenvalue_loss_weight: float = 0.0
+
+
 class DiffusionTrainer:
     """Training and sampling utilities for DDPM diffusion."""
 
     def __init__(
         self,
         model: Spec2GraphDiffusion,
-        n_timesteps: int = 1000,
-        beta_start: float = 0.0001,
-        beta_end: float = 0.02,
+        config: TrainerConfig = None,
         device: str = "cpu",
-        projection_loss_weight: float = 1.0,
-        orthonormality_loss_weight: float = 0.0,
-        fingerprint_loss_weight: float = 0.0,
-        atom_count_loss_weight: float = 0.0,
-        eigenvalue_loss_weight: float = 0.0,
     ):
         """
         Initialize the diffusion trainer.
 
         Args:
             model: The Spec2GraphDiffusion model
-            n_timesteps: Number of diffusion timesteps
-            beta_start: Starting beta value
-            beta_end: Ending beta value
+            config: Configuration for the trainer
             device: Device to use
-            projection_loss_weight: Weight for subspace-invariant projection loss
-            orthonormality_loss_weight: Weight for orthonormality regulariser on predicted eigenvectors
-            fingerprint_loss_weight: Weight for optional fingerprint auxiliary loss
-            atom_count_loss_weight: Weight for optional atom-count auxiliary loss
-            eigenvalue_loss_weight: Weight for eigenvalue prediction loss (Phase 4)
         """
+        if config is None:
+            config = TrainerConfig()
         self.model = model
-        self.n_timesteps = n_timesteps
+        self.config = config
         self.device = device
-        self.projection_loss_weight = projection_loss_weight
-        self.orthonormality_loss_weight = orthonormality_loss_weight
-        self.fingerprint_loss_weight = fingerprint_loss_weight
-        self.atom_count_loss_weight = atom_count_loss_weight
-        self.eigenvalue_loss_weight = eigenvalue_loss_weight
+
+        # Compatibility properties for existing tests/code if needed, or simply assign config to self
+        self.n_timesteps = config.n_timesteps
+        self.projection_loss_weight = config.projection_loss_weight
+        self.orthonormality_loss_weight = config.orthonormality_loss_weight
+        self.fingerprint_loss_weight = config.fingerprint_loss_weight
+        self.atom_count_loss_weight = config.atom_count_loss_weight
+        self.eigenvalue_loss_weight = config.eigenvalue_loss_weight
 
         # DDPM schedule
-        self.betas = torch.linspace(beta_start, beta_end, n_timesteps).to(device)
+        self.betas = torch.linspace(config.beta_start, config.beta_end, config.n_timesteps).to(device)
         self.alphas = 1.0 - self.betas
         self.alpha_cumprod = torch.cumprod(self.alphas, dim=0)
         self.alpha_cumprod_prev = F.pad(self.alpha_cumprod[:-1], (1, 0), value=1.0)
@@ -1943,13 +1947,16 @@ def run_demo():
 
     # Create trainer with fewer timesteps for demo
     print("\n3. Creating diffusion trainer...")
-    trainer = DiffusionTrainer(
-        model=model,
+    config = TrainerConfig(
         n_timesteps=100,  # Reduced for demo
-        device=device,
         projection_loss_weight=1.0,
         fingerprint_loss_weight=0.1,
         atom_count_loss_weight=0.05,
+    )
+    trainer = DiffusionTrainer(
+        model=model,
+        config=config,
+        device=device,
     )
 
     # Training loop
