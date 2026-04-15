@@ -1277,14 +1277,25 @@ class SpectralGraphNeuralOperator(nn.Module):
         """
         batch_size, n_atoms, k = embeddings.shape
 
-        # Compute all pairwise concatenations [E_i ; E_j]
-        # Expand to (batch, n_atoms, n_atoms, k) for both i and j
-        e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
-        e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
-        pairs = torch.cat([e_i, e_j], dim=-1)  # (batch, n_atoms, n_atoms, 2k)
+        # OPTIMIZATION: Avoid materializing the O(N^2) pairwise concatenation tensor
+        # (batch, n_atoms, n_atoms, 2k). Instead, apply the first linear layer
+        # independently to E_i and E_j, and combine via broadcasting to save memory.
+        first_layer = self.pairwise_mlp[0]
+        w_i = first_layer.weight[:, :k]
+        w_j = first_layer.weight[:, k:]
 
-        # Pass through pairwise MLP
-        logits = self.pairwise_mlp(pairs).squeeze(-1)  # (batch, n_atoms, n_atoms)
+        out_i = F.linear(embeddings, w_i)
+        out_j = F.linear(embeddings, w_j)
+        if first_layer.bias is not None:
+            out_i = out_i + first_layer.bias
+
+        x = out_i.unsqueeze(2) + out_j.unsqueeze(1)
+
+        # Pass through remaining MLP layers
+        for layer in self.pairwise_mlp[1:]:
+            x = layer(x)
+
+        logits = x.squeeze(-1)  # (batch, n_atoms, n_atoms)
 
         # Enforce symmetry: A = (A + A^T) / 2
         logits = 0.5 * (logits + logits.transpose(-1, -2))
@@ -1786,15 +1797,27 @@ class EigenvalueConditionedSGNO(nn.Module):
         # Encode eigenvalues
         eig_cond = self.eigenvalue_encoder(eigenvalues)  # (batch, eigenvalue_dim)
 
-        # Expand for pairwise computation
-        e_i = embeddings.unsqueeze(2).expand(-1, -1, n_atoms, -1)
-        e_j = embeddings.unsqueeze(1).expand(-1, n_atoms, -1, -1)
-        eig_expanded = eig_cond.unsqueeze(1).unsqueeze(1).expand(
-            -1, n_atoms, n_atoms, -1
-        )
-        pairs = torch.cat([e_i, e_j, eig_expanded], dim=-1)
+        # OPTIMIZATION: Avoid materializing the O(N^2) pairwise concatenation tensor.
+        # Split the first linear layer weights and apply them independently.
+        first_layer = self.pairwise_mlp[0]
+        w_i = first_layer.weight[:, :k]
+        w_j = first_layer.weight[:, k:2*k]
+        w_eig = first_layer.weight[:, 2*k:]
 
-        logits = self.pairwise_mlp(pairs).squeeze(-1)
+        out_i = F.linear(embeddings, w_i)
+        out_j = F.linear(embeddings, w_j)
+        out_eig = F.linear(eig_cond, w_eig)
+
+        if first_layer.bias is not None:
+            out_i = out_i + first_layer.bias
+
+        x = out_i.unsqueeze(2) + out_j.unsqueeze(1) + out_eig.unsqueeze(1).unsqueeze(2)
+
+        # Pass through remaining MLP layers
+        for layer in self.pairwise_mlp[1:]:
+            x = layer(x)
+
+        logits = x.squeeze(-1)
         logits = 0.5 * (logits + logits.transpose(-1, -2))
 
         return logits
