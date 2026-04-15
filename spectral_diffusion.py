@@ -213,7 +213,7 @@ class SpectralDataProcessor:
         return (eigenvectors @ eigenvectors.T).astype(np.float32)
 
     def smiles_to_fingerprint(
-        self, smiles: str, n_bits: int = 128, radius: int = 2
+        self, smiles: str, n_bits: int = 2048, radius: int = 2
     ) -> np.ndarray:
         """Compute Morgan fingerprint for a SMILES string."""
         self._require_rdkit()
