@@ -203,6 +203,13 @@ class SpectralDataProcessor:
             raise ValueError(
                 f"eigenvectors must be 2D (n_atoms, k), got {eigenvectors.ndim}D with shape {eigenvectors.shape}"
             )
+
+        n_vectors = eigenvectors.shape[-1]
+        k = self.k
+        if k > n_vectors:
+            raise ValueError(
+                f"Requested k={k} but only {n_vectors} eigenvectors available."
+            )
         return (eigenvectors @ eigenvectors.T).astype(np.float32)
 
     def smiles_to_fingerprint(

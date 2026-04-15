@@ -850,3 +850,10 @@ def test_process_smiles_zero_atoms():
     processor = SpectralDataProcessor()
     with pytest.raises(ValueError, match="resulted in 0 atoms after adding Hs"):
         processor.process_smiles("")
+
+
+def test_projection_matrix_raises_when_k_exceeds_eigenvectors():
+    processor = SpectralDataProcessor(k=8)
+    eigenvectors = np.random.rand(5, 4)
+    with pytest.raises(ValueError, match="Requested k=8 but only 4 eigenvectors available."):
+        processor.projection_matrix(eigenvectors)
