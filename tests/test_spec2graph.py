@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from spectral_diffusion import (
+    TrainingBatch,
     DiffusionTrainer,
     SpectralDataProcessor,
     Spec2GraphDiffusion,
@@ -273,7 +274,8 @@ class TestOrthonormalityLoss:
         x_0 = torch.randn(2, 4, 2)
         mz = torch.randn(2, 4)
         intensity = torch.randn(2, 4)
-        _, components = trainer.compute_loss(x_0, mz, intensity, return_components=True)
+        batch = TrainingBatch(x_0=x_0, mz=mz, intensity=intensity)
+        _, components = trainer.compute_loss(batch, return_components=True)
         assert "orthonormality" in components
         # Should be non-negative
         assert components["orthonormality"].item() >= 0
@@ -285,7 +287,8 @@ class TestOrthonormalityLoss:
         x_0 = torch.randn(2, 4, 2)
         mz = torch.randn(2, 4)
         intensity = torch.randn(2, 4)
-        _, components = trainer.compute_loss(x_0, mz, intensity, return_components=True)
+        batch = TrainingBatch(x_0=x_0, mz=mz, intensity=intensity)
+        _, components = trainer.compute_loss(batch, return_components=True)
         assert components["orthonormality"].item() == 0.0
 
 
@@ -362,13 +365,11 @@ class TestPrecursorConditioning:
 
         with torch.no_grad():
             torch.manual_seed(7)
-            loss_low = trainer.compute_loss(
-                x_0, mz, intensity, precursor_mz=torch.tensor([100.0])
-            )
+            batch_low = TrainingBatch(x_0=x_0, mz=mz, intensity=intensity, precursor_mz=torch.tensor([100.0]))
+            loss_low = trainer.compute_loss(batch_low)
             torch.manual_seed(7)
-            loss_high = trainer.compute_loss(
-                x_0, mz, intensity, precursor_mz=torch.tensor([500.0])
-            )
+            batch_high = TrainingBatch(x_0=x_0, mz=mz, intensity=intensity, precursor_mz=torch.tensor([500.0]))
+            loss_high = trainer.compute_loss(batch_high)
 
         assert torch.isfinite(loss_low)
         assert torch.isfinite(loss_high)
@@ -766,11 +767,8 @@ class TestEigenvalueConditioning:
         mz = torch.randn(2, 4)
         intensity = torch.randn(2, 4)
         eigenvalue_targets = torch.randn(2, 2)
-        _, components = trainer.compute_loss(
-            x_0, mz, intensity,
-            eigenvalue_targets=eigenvalue_targets,
-            return_components=True
-        )
+        batch = TrainingBatch(x_0=x_0, mz=mz, intensity=intensity, eigenvalue_targets=eigenvalue_targets)
+        _, components = trainer.compute_loss(batch, return_components=True)
         assert "eigenvalue" in components
         assert components["eigenvalue"].item() > 0
 
@@ -850,11 +848,16 @@ class TestEndToEndPipeline:
         ac = torch.tensor([4.0, 3.0])
         ev = torch.randn(2, 2)
 
-        loss_val, components = trainer.train_step(
-            optimizer, x_0, mz, intensity,
-            fingerprint_targets=fp, atom_count_targets=ac,
+        batch = TrainingBatch(
+            x_0=x_0,
+            mz=mz,
+            intensity=intensity,
+            fingerprint_targets=fp,
+            atom_count_targets=ac,
             eigenvalue_targets=ev,
-            return_components=True
+        )
+        loss_val, components = trainer.train_step(
+            optimizer, batch, return_components=True
         )
         assert isinstance(loss_val, float)
         assert loss_val > 0

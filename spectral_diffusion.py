@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Union
+from dataclasses import dataclass
 import warnings
 
 # Numerical floor to avoid divide-by-zero when reconstructing clean samples
@@ -707,6 +708,20 @@ class Spec2GraphDiffusion(nn.Module):
         return self.eigenvalue_head(pooled)
 
 
+@dataclass
+class TrainingBatch:
+    """A batch of training data containing molecular graph components and mass spectra."""
+    x_0: torch.Tensor
+    mz: torch.Tensor
+    intensity: torch.Tensor
+    atom_mask: Optional[torch.Tensor] = None
+    spectrum_mask: Optional[torch.Tensor] = None
+    precursor_mz: Optional[torch.Tensor] = None
+    fingerprint_targets: Optional[torch.Tensor] = None
+    atom_count_targets: Optional[torch.Tensor] = None
+    eigenvalue_targets: Optional[torch.Tensor] = None
+
+
 class DiffusionTrainer:
     """Training and sampling utilities for DDPM diffusion."""
 
@@ -1030,35 +1045,29 @@ class DiffusionTrainer:
 
     def compute_loss(
         self,
-        x_0: torch.Tensor,
-        mz: torch.Tensor,
-        intensity: torch.Tensor,
-        atom_mask: Optional[torch.Tensor] = None,
-        spectrum_mask: Optional[torch.Tensor] = None,
-        precursor_mz: Optional[torch.Tensor] = None,
-        fingerprint_targets: Optional[torch.Tensor] = None,
-        atom_count_targets: Optional[torch.Tensor] = None,
-        eigenvalue_targets: Optional[torch.Tensor] = None,
+        batch: TrainingBatch,
         return_components: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         """
         Compute training loss.
 
         Args:
-            x_0: Clean eigenvectors, shape (batch, n_atoms, k)
-            mz: m/z values, shape (batch, n_peaks)
-            intensity: Intensity values, shape (batch, n_peaks)
-            atom_mask: Optional atom mask
-            spectrum_mask: Optional spectrum mask
-            precursor_mz: Optional precursor m/z values
-            fingerprint_targets: Optional fingerprint labels for auxiliary loss
-            atom_count_targets: Optional atom-count labels for auxiliary loss
-            eigenvalue_targets: Optional eigenvalue labels for Phase 4 auxiliary loss
+            batch: TrainingBatch containing inputs and targets
             return_components: If True, also return component losses
 
         Returns:
             MSE loss
         """
+        x_0 = batch.x_0
+        mz = batch.mz
+        intensity = batch.intensity
+        atom_mask = batch.atom_mask
+        spectrum_mask = batch.spectrum_mask
+        precursor_mz = batch.precursor_mz
+        fingerprint_targets = batch.fingerprint_targets
+        atom_count_targets = batch.atom_count_targets
+        eigenvalue_targets = batch.eigenvalue_targets
+
         batch_size = x_0.shape[0]
 
         # Sample random timesteps
@@ -1149,31 +1158,15 @@ class DiffusionTrainer:
     def train_step(
         self,
         optimizer: torch.optim.Optimizer,
-        x_0: torch.Tensor,
-        mz: torch.Tensor,
-        intensity: torch.Tensor,
-        atom_mask: Optional[torch.Tensor] = None,
-        spectrum_mask: Optional[torch.Tensor] = None,
-        precursor_mz: Optional[torch.Tensor] = None,
-        fingerprint_targets: Optional[torch.Tensor] = None,
-        atom_count_targets: Optional[torch.Tensor] = None,
-        eigenvalue_targets: Optional[torch.Tensor] = None,
+        batch: TrainingBatch,
         return_components: bool = False,
     ) -> Union[float, Tuple[float, dict]]:
         """
         Single training step.
 
         Args:
-            optimizer: Optimizer
-            x_0: Clean eigenvectors
-            mz: m/z values
-            intensity: Intensity values
-            atom_mask: Optional atom mask
-            spectrum_mask: Optional spectrum mask
-            precursor_mz: Optional precursor m/z values
-            fingerprint_targets: Optional fingerprint labels
-            atom_count_targets: Optional atom-count labels
-            eigenvalue_targets: Optional eigenvalue labels for Phase 4 loss
+            optimizer: PyTorch optimizer
+            batch: TrainingBatch containing inputs and targets
             return_components: If True, also return component losses
 
         Returns:
@@ -1184,29 +1177,13 @@ class DiffusionTrainer:
 
         loss, components = (
             self.compute_loss(
-                x_0,
-                mz,
-                intensity,
-                atom_mask,
-                spectrum_mask,
-                precursor_mz,
-                fingerprint_targets,
-                atom_count_targets,
-                eigenvalue_targets,
+                batch,
                 return_components=True,
             )
             if return_components
             else (
                 self.compute_loss(
-                    x_0,
-                    mz,
-                    intensity,
-                    atom_mask,
-                    spectrum_mask,
-                    precursor_mz,
-                    fingerprint_targets,
-                    atom_count_targets,
-                    eigenvalue_targets,
+                    batch,
                     return_components=False,
                 ),
                 None,
@@ -1980,16 +1957,22 @@ def run_demo():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     n_steps = 20
+
+    # Create training batch
+    batch = TrainingBatch(
+        x_0=x_0,
+        mz=mz,
+        intensity=intensity,
+        atom_mask=atom_mask,
+        spectrum_mask=spectrum_mask,
+        fingerprint_targets=fp_targets,
+        atom_count_targets=atom_counts,
+    )
+
     for step in range(n_steps):
         loss, components = trainer.train_step(
             optimizer,
-            x_0,
-            mz,
-            intensity,
-            atom_mask=atom_mask,
-            spectrum_mask=spectrum_mask,
-            fingerprint_targets=fp_targets,
-            atom_count_targets=atom_counts,
+            batch,
             return_components=True,
         )
         if (step + 1) % 5 == 0:
