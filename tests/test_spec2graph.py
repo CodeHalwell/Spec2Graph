@@ -122,6 +122,39 @@ def test_smiles_to_adjacency_invalid_smiles():
         processor.smiles_to_adjacency("invalid")
 
 
+def test_sample_custom_start_point():
+    model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4)
+    trainer = DiffusionTrainer(model, n_timesteps=5)
+
+    mz = torch.rand(1, 4)
+    intensity = torch.rand(1, 4)
+    n_atoms = 3
+
+    # Custom x_t
+    x_t_custom = torch.randn(1, 3, 2)
+
+    # Call sample with custom x_t
+    result = trainer.sample(mz, intensity, n_atoms=n_atoms, x_t=x_t_custom)
+
+    assert result.shape == (1, 3, 2)
+    assert torch.all(torch.isfinite(result))
+
+
+def test_sample_custom_start_point_shape_mismatch():
+    model = Spec2GraphDiffusion(k=2, max_atoms=4, max_peaks=4)
+    trainer = DiffusionTrainer(model, n_timesteps=5)
+
+    mz = torch.rand(1, 4)
+    intensity = torch.rand(1, 4)
+    n_atoms = 3
+
+    # Custom x_t with incorrect shape (batch_size=2 instead of 1)
+    x_t_custom = torch.randn(2, 3, 2)
+
+    # Should raise ValueError due to shape mismatch
+    with pytest.raises(ValueError, match="Expected x_t shape"):
+        trainer.sample(mz, intensity, n_atoms=n_atoms, x_t=x_t_custom)
+
 def test_bond_weighting_distinguishes_double_bond():
     single = SpectralDataProcessor(bond_weighting="order").smiles_to_adjacency("CC")
     double = SpectralDataProcessor(bond_weighting="order").smiles_to_adjacency("C=C")
