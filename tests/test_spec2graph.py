@@ -844,3 +844,9 @@ class TestValidateMask:
         mask = torch.tensor([[True, False], [False, False]], dtype=torch.bool)
         with pytest.raises(ValueError, match="must contain at least one valid element"):
             Spec2GraphDiffusion._validate_mask(mask, "test_mask")
+
+
+def test_process_smiles_zero_atoms():
+    processor = SpectralDataProcessor()
+    with pytest.raises(ValueError, match="resulted in 0 atoms after adding Hs"):
+        processor.process_smiles("")
