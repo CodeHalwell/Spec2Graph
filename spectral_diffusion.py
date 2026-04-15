@@ -505,13 +505,13 @@ class Spec2GraphDiffusion(nn.Module):
             self.precursor_fusion = nn.Linear(d_model * 2, d_model)
 
     @staticmethod
-    def _validate_mask(mask: torch.Tensor, name: str) -> None:
+    def _validate_mask(mask: torch.Tensor, name: str, expected_length: Optional[int] = None) -> None:
         """Ensure masks follow the True=valid convention and have at least one valid token."""
         if mask.dtype != torch.bool:
             raise ValueError(f"{name} must be a boolean tensor with True indicating valid entries.")
-        if mask.dim() < 2:
+        if mask.dim() != 2 or (expected_length is not None and mask.shape[1] != expected_length):
             raise ValueError(f"{name} must have shape (batch, length); got {mask.shape}.")
-        if torch.any(mask.sum(dim=1) == 0):
+        if not mask.any(dim=1).all():
             raise ValueError(f"{name} must contain at least one valid element per batch item.")
 
     def encode_spectrum(
@@ -540,7 +540,7 @@ class Spec2GraphDiffusion(nn.Module):
 
         # Apply transformer encoder
         if mask is not None:
-            self._validate_mask(mask, "spectrum_mask")
+            self._validate_mask(mask, "spectrum_mask", expected_length=mz.shape[1])
             # Convert to attention mask format (True = ignore)
             src_key_padding_mask = ~mask
         else:
@@ -617,7 +617,7 @@ class Spec2GraphDiffusion(nn.Module):
 
         # Prepare masks
         if atom_mask is not None:
-            self._validate_mask(atom_mask, "atom_mask")
+            self._validate_mask(atom_mask, "atom_mask", expected_length=n_atoms)
             tgt_key_padding_mask = ~atom_mask
         else:
             tgt_key_padding_mask = None
