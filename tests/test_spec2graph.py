@@ -603,6 +603,34 @@ class TestValencyDecoder:
 
 
 # ==============================================================================
+# Atom Count Head Tests
+# ==============================================================================
+
+
+class TestAtomCountHead:
+    def test_atom_count_head_prediction_shape(self):
+        model = Spec2GraphDiffusion(
+            k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
+            num_encoder_layers=1, num_decoder_layers=1,
+            enable_atom_count_head=True
+        )
+        mz = torch.randn(2, 10)
+        intensity = torch.randn(2, 10)
+        pred = model.predict_atom_count(mz, intensity)
+        assert pred.shape == (2,)
+
+    def test_atom_count_head_disabled_raises(self):
+        model = Spec2GraphDiffusion(
+            k=4, max_atoms=8, max_peaks=10, d_model=32, nhead=4,
+            enable_atom_count_head=False
+        )
+        mz = torch.randn(1, 10)
+        intensity = torch.randn(1, 10)
+        with pytest.raises(ValueError, match="Atom count head is disabled"):
+            model.predict_atom_count(mz, intensity)
+
+
+# ==============================================================================
 # Eigenvalue Conditioning Tests (Phase 4, Section 8)
 # ==============================================================================
 
