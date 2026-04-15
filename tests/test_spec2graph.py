@@ -815,3 +815,32 @@ class TestEndToEndPipeline:
             "noise", "projection", "orthonormality", "fingerprint", "atom_count",
             "eigenvalue"
         ])
+
+class TestValidateMask:
+    def test_validate_mask_correct(self):
+        """Valid masks should pass without raising exceptions."""
+        mask = torch.tensor([[True, True], [False, True]], dtype=torch.bool)
+        # Should not raise
+        Spec2GraphDiffusion._validate_mask(mask, "test_mask")
+
+    def test_validate_mask_wrong_dtype(self):
+        """Non-boolean masks should raise ValueError."""
+        mask = torch.tensor([[1, 0], [0, 1]], dtype=torch.int)
+        with pytest.raises(ValueError, match="must be a boolean tensor"):
+            Spec2GraphDiffusion._validate_mask(mask, "test_mask")
+
+        mask_float = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float)
+        with pytest.raises(ValueError, match="must be a boolean tensor"):
+            Spec2GraphDiffusion._validate_mask(mask_float, "test_mask")
+
+    def test_validate_mask_wrong_dim(self):
+        """Masks with fewer than 2 dimensions should raise ValueError."""
+        mask = torch.tensor([True, False], dtype=torch.bool)
+        with pytest.raises(ValueError, match="must have shape \\(batch, length\\)"):
+            Spec2GraphDiffusion._validate_mask(mask, "test_mask")
+
+    def test_validate_mask_all_false(self):
+        """Masks where any batch item has all False entries should raise ValueError."""
+        mask = torch.tensor([[True, False], [False, False]], dtype=torch.bool)
+        with pytest.raises(ValueError, match="must contain at least one valid element"):
+            Spec2GraphDiffusion._validate_mask(mask, "test_mask")
