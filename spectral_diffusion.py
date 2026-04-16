@@ -349,6 +349,14 @@ class TimestepEmbedding(nn.Module):
         self.d_model = d_model
         self.max_period = max_period
 
+        half_dim = self.d_model // 2
+        freqs = torch.exp(
+            -math.log(self.max_period)
+            * torch.arange(half_dim, dtype=torch.float32)
+            / half_dim
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -365,13 +373,7 @@ class TimestepEmbedding(nn.Module):
         Returns:
             Embedding of shape (batch, d_model)
         """
-        half_dim = self.d_model // 2
-        freqs = torch.exp(
-            -math.log(self.max_period)
-            * torch.arange(half_dim, device=t.device, dtype=torch.float32)
-            / half_dim
-        )
-        args = t.float().unsqueeze(-1) * freqs
+        args = t.float().unsqueeze(-1) * self.freqs
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
         if self.d_model % 2 == 1:
@@ -1240,11 +1242,9 @@ class SpectralGraphNeuralOperator(nn.Module):
     @staticmethod
     def _zero_diagonal(matrix: torch.Tensor) -> torch.Tensor:
         """Force zero self-loops for batched square matrices."""
-        n_atoms = matrix.shape[-1]
-        diagonal_mask = torch.eye(
-            n_atoms, device=matrix.device, dtype=torch.bool
-        ).unsqueeze(0)
-        return matrix.masked_fill(diagonal_mask, 0.0)
+        result = matrix.clone()
+        result.diagonal(dim1=-2, dim2=-1).zero_()
+        return result
 
     def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
         """
