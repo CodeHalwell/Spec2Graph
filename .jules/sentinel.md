@@ -1,0 +1,4 @@
+## 2025-02-28 - Missing length limits on inputs
+**Vulnerability:** Methods processing SMILES strings and Mass Spectrum data did not have sufficient length limits. `SpectralDataProcessor.smiles_to_adjacency` and `smiles_to_fingerprint` pass strings to RDKit, which could be extremely large and cause a Denial of Service (DoS) by hogging CPU/Memory. `Spec2GraphDiffusion.encode_spectrum` processes `mz` and `intensity` sequences via a Transformer, which has O(N^2) complexity with sequence length. Although `max_peaks` is configured, it wasn't validated in `encode_spectrum`.
+**Learning:** External dependencies like RDKit and O(N^2) architectures like Transformers are sensitive to unbounded inputs. Even if the expected input is typically small, missing hard limits opens vectors for DoS.
+**Prevention:** Always implement hard input length boundaries before passing data into external parsing libraries or computationally complex operations.
