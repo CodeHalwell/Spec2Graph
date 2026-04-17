@@ -279,7 +279,13 @@ class FourierMzEmbedding(nn.Module):
                 math.log(1.0), math.log(max_mz / 2.0), num_freqs // 2
             )
         )
+        # Keep old buffer for backward compatibility with state_dicts
         self.register_buffer("freqs", freqs)
+
+        # Precompute the fully scaled frequencies to avoid normalizations and multiplication
+        # at each forward pass
+        scaled_freqs = freqs * 2 * math.pi / max_mz
+        self.register_buffer("scaled_freqs", scaled_freqs, persistent=False)
 
         # Projection layer
         self.proj = nn.Linear(num_freqs, d_model)
@@ -294,12 +300,9 @@ class FourierMzEmbedding(nn.Module):
         Returns:
             Embeddings of shape (batch, n_peaks, d_model)
         """
-        # Normalize m/z values
-        mz_norm = mz / self.max_mz
-
-        # Compute Fourier features
+        # Compute Fourier features using precomputed scaled frequencies
         # Shape: (batch, n_peaks, num_freqs // 2)
-        angles = mz_norm.unsqueeze(-1) * self.freqs * 2 * math.pi
+        angles = mz.unsqueeze(-1) * self.scaled_freqs
 
         # Sin and cos features
         features = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
@@ -355,6 +358,15 @@ class TimestepEmbedding(nn.Module):
             nn.Linear(d_model * 4, d_model),
         )
 
+        # Precompute frequency bands
+        half_dim = self.d_model // 2
+        freqs = torch.exp(
+            -math.log(self.max_period)
+            * torch.arange(half_dim, dtype=torch.float32)
+            / half_dim
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
         Compute timestep embedding.
@@ -365,13 +377,7 @@ class TimestepEmbedding(nn.Module):
         Returns:
             Embedding of shape (batch, d_model)
         """
-        half_dim = self.d_model // 2
-        freqs = torch.exp(
-            -math.log(self.max_period)
-            * torch.arange(half_dim, device=t.device, dtype=torch.float32)
-            / half_dim
-        )
-        args = t.float().unsqueeze(-1) * freqs
+        args = t.float().unsqueeze(-1) * self.freqs
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
         if self.d_model % 2 == 1:
