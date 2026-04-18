@@ -1240,11 +1240,11 @@ class SpectralGraphNeuralOperator(nn.Module):
     @staticmethod
     def _zero_diagonal(matrix: torch.Tensor) -> torch.Tensor:
         """Force zero self-loops for batched square matrices."""
-        n_atoms = matrix.shape[-1]
-        diagonal_mask = torch.eye(
-            n_atoms, device=matrix.device, dtype=torch.bool
-        ).unsqueeze(0)
-        return matrix.masked_fill(diagonal_mask, 0.0)
+        # OPTIMIZATION: Avoid O(N^2) memory overhead from torch.eye mask
+        # and masked_fill. Directly modifying the diagonal is much faster.
+        out = matrix.clone()
+        out.diagonal(dim1=-2, dim2=-1).zero_()
+        return out
 
     def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
         """
