@@ -83,6 +83,8 @@ class SpectralDataProcessor:
             Adjacency matrix as numpy array
         """
         self._require_rdkit()
+        if len(smiles) > 5000:
+            raise ValueError("SMILES string too long (exceeds 5000 characters).")
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
@@ -223,6 +225,8 @@ class SpectralDataProcessor:
     ) -> np.ndarray:
         """Compute Morgan fingerprint for a SMILES string."""
         self._require_rdkit()
+        if len(smiles) > 5000:
+            raise ValueError("SMILES string too long (exceeds 5000 characters).")
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
@@ -535,6 +539,9 @@ class Spec2GraphDiffusion(nn.Module):
         Returns:
             Encoded spectrum, shape (batch, n_peaks, d_model)
         """
+        if mz.shape[1] > self.max_peaks:
+            raise ValueError(f"Number of peaks ({mz.shape[1]}) exceeds configured max_peaks ({self.max_peaks}).")
+
         # Combine m/z and intensity embeddings
         mz_emb = self.mz_embedding(mz)
         int_emb = self.intensity_embedding(intensity)
