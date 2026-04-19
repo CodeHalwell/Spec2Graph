@@ -1,0 +1,4 @@
+## 2024-05-18 - Missing Length Bounds on RDKit Parsing and Transformer Inputs
+**Vulnerability:** External string inputs (SMILES) passed to RDKit's parser and tensor peak arrays passed to the Spec2Graph Transformer did not have upper bounds, leading to potential Denial of Service (DoS) attacks via memory exhaustion. RDKit and O(N^2) Transformer mechanisms are vulnerable to extreme inputs.
+**Learning:** In machine learning processing pipelines, memory-intensive modules (like molecular parsing and self-attention) must implement hard size limits on inputs before computation, even if downstream layers process it.
+**Prevention:** Always implement an initial size check (e.g., `len(smiles) <= MAX_LEN` or `mz.shape[1] <= max_peaks`) at the very edge of the API or forward pass method to drop excessively large payloads immediately.
