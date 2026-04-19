@@ -965,3 +965,113 @@ class TestSpectralDataProcessor:
         processor = SpectralDataProcessor()
         with pytest.raises(ValueError, match="Invalid SMILES:"):
             processor.smiles_to_fingerprint("invalid_smiles_string")
+
+
+class TestInputValidationBoundaries:
+    """Regression tests for the DoS-hardening input validation."""
+
+    def test_smiles_to_adjacency_rejects_overlong_smiles(self):
+        from spectral_diffusion import MAX_SMILES_LENGTH
+
+        processor = SpectralDataProcessor()
+        overlong = "C" * (MAX_SMILES_LENGTH + 1)
+        with pytest.raises(ValueError, match="SMILES string too long"):
+            processor.smiles_to_adjacency(overlong)
+
+    def test_smiles_to_fingerprint_rejects_overlong_smiles(self):
+        from spectral_diffusion import MAX_SMILES_LENGTH
+
+        processor = SpectralDataProcessor()
+        overlong = "C" * (MAX_SMILES_LENGTH + 1)
+        with pytest.raises(ValueError, match="SMILES string too long"):
+            processor.smiles_to_fingerprint(overlong)
+
+    def test_encode_spectrum_rejects_n_peaks_above_max(self):
+        model = Spec2GraphDiffusion(
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=16, nhead=2,
+                num_encoder_layers=1, num_decoder_layers=1,
+            )
+        )
+        mz = torch.zeros(1, model.max_peaks + 1)
+        intensity = torch.zeros(1, model.max_peaks + 1)
+        with pytest.raises(ValueError, match="exceeds configured max_peaks"):
+            model.encode_spectrum(mz, intensity)
+
+    def test_encode_spectrum_allows_n_peaks_at_boundary(self):
+        model = Spec2GraphDiffusion(
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=16, nhead=2,
+                num_encoder_layers=1, num_decoder_layers=1,
+            )
+        )
+        mz = torch.zeros(1, model.max_peaks)
+        intensity = torch.zeros(1, model.max_peaks)
+        # Should not raise
+        enc = model.encode_spectrum(mz, intensity)
+        assert enc.shape == (1, model.max_peaks, 16)
+
+    def test_encode_spectrum_rejects_1d_mz(self):
+        model = Spec2GraphDiffusion(
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=16, nhead=2,
+                num_encoder_layers=1, num_decoder_layers=1,
+            )
+        )
+        with pytest.raises(ValueError, match="mz must have shape"):
+            model.encode_spectrum(torch.zeros(4), torch.zeros(1, 4))
+
+    def test_encode_spectrum_rejects_shape_mismatch(self):
+        model = Spec2GraphDiffusion(
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=16, nhead=2,
+                num_encoder_layers=1, num_decoder_layers=1,
+            )
+        )
+        with pytest.raises(ValueError, match="matching shape"):
+            model.encode_spectrum(torch.zeros(1, 4), torch.zeros(1, 3))
+
+    def test_zero_diagonal_rejects_non_square(self):
+        sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=8, num_layers=1)
+        rectangular = torch.zeros(1, 3, 4)
+        with pytest.raises(ValueError, match="batched square matrices"):
+            sgno._zero_diagonal(rectangular)
+
+    def test_zero_diagonal_zeroes_square(self):
+        sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=8, num_layers=1)
+        m = torch.ones(2, 3, 3)
+        out = sgno._zero_diagonal(m)
+        assert torch.all(out.diagonal(dim1=-2, dim2=-1) == 0)
+        # Off-diagonal entries should be preserved
+        assert out[0, 0, 1].item() == 1.0
+        # Input must not be mutated (clone semantics)
+        assert torch.all(m == 1.0)
+
+
+class TestEmbeddingBufferConsistency:
+    """Ensure precomputed embedding buffers stay consistent across load_state_dict."""
+
+    def test_fourier_mz_embedding_refreshes_scaled_freqs_on_load(self):
+        from spectral_diffusion import FourierMzEmbedding
+
+        src = FourierMzEmbedding(d_model=16, max_mz=2000.0, num_freqs=8)
+        dst = FourierMzEmbedding(d_model=16, max_mz=2000.0, num_freqs=8)
+
+        # Perturb the source buffer so the derived scaled_freqs must be refreshed
+        with torch.no_grad():
+            src.freqs.mul_(2.0)
+            src.scaled_freqs = src._compute_scaled_freqs(src.freqs)
+
+        dst.load_state_dict(src.state_dict(), strict=True)
+
+        assert torch.allclose(dst.freqs, src.freqs)
+        assert torch.allclose(dst.scaled_freqs, src.scaled_freqs)
+
+    def test_timestep_embedding_handles_small_d_model(self):
+        from spectral_diffusion import TimestepEmbedding
+
+        # d_model=1 -> half_dim=0; precompute must not divide by zero
+        emb = TimestepEmbedding(d_model=2, max_period=100)
+        out = emb(torch.tensor([0.0, 1.0]))
+        assert out.shape == (2, 2)
+        assert torch.all(torch.isfinite(out))
