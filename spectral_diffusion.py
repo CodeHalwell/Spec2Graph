@@ -35,6 +35,9 @@ PROJECTION_EPS = 1e-8
 PROJECTION_WARNING_THRESHOLD = 256
 # Emit projection warning only once to avoid log spam during training
 PROJECTION_WARNING_EMITTED = False
+# Hard cap on SMILES string length to prevent DoS via unbounded RDKit parsing
+# and downstream O(N^3) eigendecomposition.
+MAX_SMILES_LENGTH = 2000
 
 try:
     from rdkit import Chem, DataStructs
@@ -83,8 +86,15 @@ class SpectralDataProcessor:
             Adjacency matrix as numpy array
         """
         self._require_rdkit()
-        if len(smiles) > 2000:
-            raise ValueError(f"SMILES string too long (length: {len(smiles)}). Maximum allowed length is 2000.")
+        if not isinstance(smiles, str):
+            raise TypeError(
+                f"SMILES must be a string; got {type(smiles).__name__}."
+            )
+        if len(smiles) > MAX_SMILES_LENGTH:
+            raise ValueError(
+                f"SMILES string too long (length: {len(smiles)}). "
+                f"Maximum allowed length is {MAX_SMILES_LENGTH}."
+            )
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
@@ -225,8 +235,15 @@ class SpectralDataProcessor:
     ) -> np.ndarray:
         """Compute Morgan fingerprint for a SMILES string."""
         self._require_rdkit()
-        if len(smiles) > 2000:
-            raise ValueError(f"SMILES string too long (length: {len(smiles)}). Maximum allowed length is 2000.")
+        if not isinstance(smiles, str):
+            raise TypeError(
+                f"SMILES must be a string; got {type(smiles).__name__}."
+            )
+        if len(smiles) > MAX_SMILES_LENGTH:
+            raise ValueError(
+                f"SMILES string too long (length: {len(smiles)}). "
+                f"Maximum allowed length is {MAX_SMILES_LENGTH}."
+            )
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
@@ -277,7 +294,8 @@ class FourierMzEmbedding(nn.Module):
         self.max_mz = max_mz
         self.num_freqs = num_freqs
 
-        # Create frequency bands
+        # Create frequency bands. `freqs` is kept as the persistent buffer to
+        # preserve state_dict compatibility for existing checkpoints.
         freqs = torch.exp(
             torch.linspace(
                 math.log(1.0), math.log(max_mz / 2.0), num_freqs // 2
@@ -285,8 +303,42 @@ class FourierMzEmbedding(nn.Module):
         )
         self.register_buffer("freqs", freqs)
 
+        # Precompute the fully-scaled angular frequencies so the forward pass
+        # avoids repeated normalization + 2*pi multiplication. Derived buffer,
+        # so it is non-persistent and refreshed after load_state_dict.
+        self.register_buffer(
+            "scaled_freqs",
+            self._compute_scaled_freqs(freqs),
+            persistent=False,
+        )
+
         # Projection layer
         self.proj = nn.Linear(num_freqs, d_model)
+
+    def _compute_scaled_freqs(self, freqs: torch.Tensor) -> torch.Tensor:
+        return freqs * (2.0 * math.pi / self.max_mz)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        # Keep derived buffer in sync when freqs is overwritten by a checkpoint.
+        self.scaled_freqs = self._compute_scaled_freqs(self.freqs)
 
     def forward(self, mz: torch.Tensor) -> torch.Tensor:
         """
@@ -298,12 +350,9 @@ class FourierMzEmbedding(nn.Module):
         Returns:
             Embeddings of shape (batch, n_peaks, d_model)
         """
-        # Normalize m/z values
-        mz_norm = mz / self.max_mz
-
-        # Compute Fourier features
+        # Compute Fourier features using precomputed scaled frequencies.
         # Shape: (batch, n_peaks, num_freqs // 2)
-        angles = mz_norm.unsqueeze(-1) * self.freqs * 2 * math.pi
+        angles = mz.unsqueeze(-1) * self.scaled_freqs
 
         # Sin and cos features
         features = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
@@ -353,6 +402,20 @@ class TimestepEmbedding(nn.Module):
         self.d_model = d_model
         self.max_period = max_period
 
+        # Precompute sinusoidal frequency bands once; they depend only on
+        # d_model/max_period. Non-persistent so load_state_dict with older
+        # checkpoints keeps working.
+        half_dim = self.d_model // 2
+        if half_dim > 0:
+            freqs = torch.exp(
+                -math.log(self.max_period)
+                * torch.arange(half_dim, dtype=torch.float32)
+                / half_dim
+            )
+        else:
+            freqs = torch.zeros(0, dtype=torch.float32)
+        self.register_buffer("freqs", freqs, persistent=False)
+
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -369,13 +432,7 @@ class TimestepEmbedding(nn.Module):
         Returns:
             Embedding of shape (batch, d_model)
         """
-        half_dim = self.d_model // 2
-        freqs = torch.exp(
-            -math.log(self.max_period)
-            * torch.arange(half_dim, device=t.device, dtype=torch.float32)
-            / half_dim
-        )
-        args = t.float().unsqueeze(-1) * freqs
+        args = t.float().unsqueeze(-1) * self.freqs
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
         if self.d_model % 2 == 1:
@@ -539,8 +596,31 @@ class Spec2GraphDiffusion(nn.Module):
         Returns:
             Encoded spectrum, shape (batch, n_peaks, d_model)
         """
+        if mz.dim() != 2:
+            raise ValueError(
+                f"mz must have shape (batch, n_peaks); got {tuple(mz.shape)}."
+            )
+        if intensity.dim() != 2:
+            raise ValueError(
+                f"intensity must have shape (batch, n_peaks); got {tuple(intensity.shape)}."
+            )
+        if mz.shape != intensity.shape:
+            raise ValueError(
+                f"mz and intensity must have matching shape (batch, n_peaks); "
+                f"got {tuple(mz.shape)} and {tuple(intensity.shape)}."
+            )
         if mz.shape[1] > self.max_peaks:
-            raise ValueError(f"Number of peaks ({mz.shape[1]}) exceeds maximum allowed ({self.max_peaks})")
+            raise ValueError(
+                f"Number of peaks ({mz.shape[1]}) exceeds configured max_peaks "
+                f"({self.max_peaks}); truncate the input or increase max_peaks."
+            )
+        if precursor_mz is not None and (
+            precursor_mz.dim() != 1 or precursor_mz.shape[0] != mz.shape[0]
+        ):
+            raise ValueError(
+                f"precursor_mz must have shape (batch,) matching mz's batch "
+                f"dimension ({mz.shape[0]}); got {tuple(precursor_mz.shape)}."
+            )
 
         # Combine m/z and intensity embeddings
         mz_emb = self.mz_embedding(mz)
@@ -1247,9 +1327,16 @@ class SpectralGraphNeuralOperator(nn.Module):
     @staticmethod
     def _zero_diagonal(matrix: torch.Tensor) -> torch.Tensor:
         """Force zero self-loops for batched square matrices."""
-        # OPTIMIZATION: Use .diagonal().zero_() instead of allocating an O(N^2)
-        # identity matrix and using masked_fill. This avoids memory overhead
-        # and runs ~3x faster. matrix is cloned to avoid in-place mutation issues.
+        # Preserve the square-matrix contract — diagonal().zero_() would silently
+        # operate on min(n, m) of a rectangular matrix, hiding upstream bugs.
+        if matrix.dim() < 2 or matrix.shape[-1] != matrix.shape[-2]:
+            raise ValueError(
+                f"_zero_diagonal expects batched square matrices; got shape "
+                f"{tuple(matrix.shape)}."
+            )
+        # Use .diagonal().zero_() instead of allocating an O(N^2) identity mask
+        # and running masked_fill. Clone first so we don't mutate an autograd
+        # intermediate in-place.
         matrix = matrix.clone()
         matrix.diagonal(dim1=-2, dim2=-1).zero_()
         return matrix
