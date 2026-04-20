@@ -353,6 +353,17 @@ class TimestepEmbedding(nn.Module):
         self.d_model = d_model
         self.max_period = max_period
 
+        # OPTIMIZATION: Precompute frequencies and register as buffer
+        # to avoid allocation and calculation on every forward pass.
+        # Use persistent=False to avoid backward compatibility issues with state_dicts.
+        half_dim = self.d_model // 2
+        freqs = torch.exp(
+            -math.log(self.max_period)
+            * torch.arange(half_dim, dtype=torch.float32)
+            / half_dim
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
@@ -369,13 +380,7 @@ class TimestepEmbedding(nn.Module):
         Returns:
             Embedding of shape (batch, d_model)
         """
-        half_dim = self.d_model // 2
-        freqs = torch.exp(
-            -math.log(self.max_period)
-            * torch.arange(half_dim, device=t.device, dtype=torch.float32)
-            / half_dim
-        )
-        args = t.float().unsqueeze(-1) * freqs
+        args = t.float().unsqueeze(-1) * self.freqs
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
         if self.d_model % 2 == 1:
