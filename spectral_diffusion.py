@@ -86,9 +86,13 @@ class SpectralDataProcessor:
             Adjacency matrix as numpy array
         """
         self._require_rdkit()
-        if not isinstance(smiles, str) or len(smiles) > MAX_SMILES_LENGTH:
+        if not isinstance(smiles, str):
+            raise TypeError(
+                f"SMILES must be a string; got {type(smiles).__name__}."
+            )
+        if len(smiles) > MAX_SMILES_LENGTH:
             raise ValueError(
-                f"SMILES string too long (length: {len(smiles) if isinstance(smiles, str) else 'N/A'}). "
+                f"SMILES string too long (length: {len(smiles)}). "
                 f"Maximum allowed length is {MAX_SMILES_LENGTH}."
             )
         mol = Chem.MolFromSmiles(smiles)
@@ -231,9 +235,13 @@ class SpectralDataProcessor:
     ) -> np.ndarray:
         """Compute Morgan fingerprint for a SMILES string."""
         self._require_rdkit()
-        if not isinstance(smiles, str) or len(smiles) > MAX_SMILES_LENGTH:
+        if not isinstance(smiles, str):
+            raise TypeError(
+                f"SMILES must be a string; got {type(smiles).__name__}."
+            )
+        if len(smiles) > MAX_SMILES_LENGTH:
             raise ValueError(
-                f"SMILES string too long (length: {len(smiles) if isinstance(smiles, str) else 'N/A'}). "
+                f"SMILES string too long (length: {len(smiles)}). "
                 f"Maximum allowed length is {MAX_SMILES_LENGTH}."
             )
         mol = Chem.MolFromSmiles(smiles)
@@ -605,6 +613,13 @@ class Spec2GraphDiffusion(nn.Module):
             raise ValueError(
                 f"Number of peaks ({mz.shape[1]}) exceeds configured max_peaks "
                 f"({self.max_peaks}); truncate the input or increase max_peaks."
+            )
+        if precursor_mz is not None and (
+            precursor_mz.dim() != 1 or precursor_mz.shape[0] != mz.shape[0]
+        ):
+            raise ValueError(
+                f"precursor_mz must have shape (batch,) matching mz's batch "
+                f"dimension ({mz.shape[0]}); got {tuple(precursor_mz.shape)}."
             )
 
         # Combine m/z and intensity embeddings
@@ -1314,10 +1329,10 @@ class SpectralGraphNeuralOperator(nn.Module):
         """Force zero self-loops for batched square matrices."""
         # Preserve the square-matrix contract — diagonal().zero_() would silently
         # operate on min(n, m) of a rectangular matrix, hiding upstream bugs.
-        if matrix.shape[-1] != matrix.shape[-2]:
+        if matrix.dim() < 2 or matrix.shape[-1] != matrix.shape[-2]:
             raise ValueError(
-                f"_zero_diagonal expects batched square matrices; got trailing "
-                f"shape {tuple(matrix.shape[-2:])}."
+                f"_zero_diagonal expects batched square matrices; got shape "
+                f"{tuple(matrix.shape)}."
             )
         # Use .diagonal().zero_() instead of allocating an O(N^2) identity mask
         # and running masked_fill. Clone first so we don't mutate an autograd

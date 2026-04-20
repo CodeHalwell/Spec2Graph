@@ -986,6 +986,16 @@ class TestInputValidationBoundaries:
         with pytest.raises(ValueError, match="SMILES string too long"):
             processor.smiles_to_fingerprint(overlong)
 
+    def test_smiles_to_adjacency_rejects_non_string(self):
+        processor = SpectralDataProcessor()
+        with pytest.raises(TypeError, match="SMILES must be a string"):
+            processor.smiles_to_adjacency(12345)
+
+    def test_smiles_to_fingerprint_rejects_non_string(self):
+        processor = SpectralDataProcessor()
+        with pytest.raises(TypeError, match="SMILES must be a string"):
+            processor.smiles_to_fingerprint(12345)
+
     def test_encode_spectrum_rejects_n_peaks_above_max(self):
         model = Spec2GraphDiffusion(
             Spec2GraphDiffusionConfig(
@@ -1037,6 +1047,28 @@ class TestInputValidationBoundaries:
         with pytest.raises(ValueError, match="batched square matrices"):
             sgno._zero_diagonal(rectangular)
 
+    def test_zero_diagonal_rejects_sub_2d(self):
+        sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=8, num_layers=1)
+        with pytest.raises(ValueError, match="batched square matrices"):
+            sgno._zero_diagonal(torch.zeros(4))
+
+    def test_encode_spectrum_rejects_bad_precursor_mz(self):
+        model = Spec2GraphDiffusion(
+            Spec2GraphDiffusionConfig(
+                k=2, max_atoms=4, max_peaks=4, d_model=16, nhead=2,
+                num_encoder_layers=1, num_decoder_layers=1,
+                enable_precursor_conditioning=True,
+            )
+        )
+        mz = torch.zeros(2, 4)
+        intensity = torch.zeros(2, 4)
+        # 2D precursor_mz should be rejected
+        with pytest.raises(ValueError, match="precursor_mz must have shape"):
+            model.encode_spectrum(mz, intensity, precursor_mz=torch.zeros(2, 1))
+        # Mismatched batch dimension should also be rejected
+        with pytest.raises(ValueError, match="precursor_mz must have shape"):
+            model.encode_spectrum(mz, intensity, precursor_mz=torch.zeros(3))
+
     def test_zero_diagonal_zeroes_square(self):
         sgno = SpectralGraphNeuralOperator(k=2, hidden_dim=8, num_layers=1)
         m = torch.ones(2, 3, 3)
@@ -1071,7 +1103,8 @@ class TestEmbeddingBufferConsistency:
         from spectral_diffusion import TimestepEmbedding
 
         # d_model=1 -> half_dim=0; precompute must not divide by zero
-        emb = TimestepEmbedding(d_model=2, max_period=100)
+        emb = TimestepEmbedding(d_model=1, max_period=100)
+        assert emb.freqs.numel() == 0
         out = emb(torch.tensor([0.0, 1.0]))
-        assert out.shape == (2, 2)
+        assert out.shape == (2, 1)
         assert torch.all(torch.isfinite(out))
