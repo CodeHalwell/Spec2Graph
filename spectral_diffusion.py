@@ -230,6 +230,12 @@ class SpectralDataProcessor:
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             raise ValueError(f"Invalid SMILES: {smiles}")
+
+        num_atoms = mol.GetNumAtoms()
+        if num_atoms == 0:
+            raise ValueError(
+                f"SMILES {smiles} resulted in 0 atoms after adding Hs."
+            )
         fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
         arr = np.zeros((n_bits,), dtype=np.float32)
         DataStructs.ConvertToNumpyArray(fp, arr)

@@ -941,6 +941,11 @@ def test_projection_matrix_raises_when_k_exceeds_eigenvectors():
 
 
 class TestSpectralDataProcessor:
+    def test_smiles_to_fingerprint_zero_atoms(self):
+        processor = SpectralDataProcessor()
+        with pytest.raises(ValueError, match="resulted in 0 atoms after adding Hs"):
+            processor.smiles_to_fingerprint("")
+
     def test_smiles_to_fingerprint_valid(self):
         """Valid SMILES should return a binary numpy array of expected length."""
         processor = SpectralDataProcessor()
