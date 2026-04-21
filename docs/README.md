@@ -39,6 +39,10 @@ and every stage referenced below points back to specific line numbers there.
     decoders.
 12. [12 — End-to-end walkthrough](./12_end_to_end_walkthrough.md)
     Tying it all together with the exact calls from `run_demo()`.
+13. [13 — Per-atom element head](./13_atom_type_head.md)
+    Optional head that predicts element identity per atom slot, closing
+    the atom-ordering gap between predicted eigenvectors and a real
+    molecule.
 
 ## Who this is for
 
