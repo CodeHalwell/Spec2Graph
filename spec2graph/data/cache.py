@@ -112,31 +112,32 @@ class EigenvectorCache:
         Guards against torn writes from interrupted processes — a reader
         will either see the old file, the new file, or a missing file,
         never a half-written one.
+
+        Writes through the raw file descriptor so ``np.save`` does not
+        apply its string-path ``.npy`` suffix logic. Passing the path as
+        a string made ``np.save`` write to ``tmp_path + ".npy"``, leaving
+        the ``mkstemp`` placeholder empty and causing the later
+        ``os.replace`` to promote that empty file to the destination.
         """
         destination.parent.mkdir(parents=True, exist_ok=True)
-        # ``tempfile.NamedTemporaryFile`` on the same directory guarantees
-        # the os.replace target is on the same filesystem.
+        # mkstemp creates the file on the same filesystem as destination,
+        # which is a prerequisite for atomic os.replace.
         fd, tmp_path = tempfile.mkstemp(
             prefix=destination.name + ".", suffix=".tmp", dir=destination.parent
         )
-        os.close(fd)
         try:
-            np.save(tmp_path, array, allow_pickle=False)
-            # np.save appends ``.npy`` to the path if it is missing. We
-            # mkstemp gave us an exact path with no extension; np.save
-            # writes to ``tmp_path + ".npy"``. Rename that to destination.
-            saved_path = Path(tmp_path)
-            if not saved_path.exists():
-                saved_path = Path(tmp_path + ".npy")
-            os.replace(saved_path, destination)
-        finally:
-            # Clean up stray temp file if anything above raised before replace.
-            for candidate in (Path(tmp_path), Path(tmp_path + ".npy")):
-                if candidate.exists():
-                    try:
-                        candidate.unlink()
-                    except OSError:
-                        pass
+            with os.fdopen(fd, "wb") as handle:
+                np.save(handle, array, allow_pickle=False)
+            os.replace(tmp_path, destination)
+        except BaseException:
+            # If anything between mkstemp and replace raised (including
+            # KeyboardInterrupt), remove the stale temp file so the next
+            # call does not trip over it.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _load_npy(self, path: Path) -> Optional[np.ndarray]:
         """Load a cached ``.npy`` file, or return ``None`` if corrupted.

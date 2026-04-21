@@ -93,8 +93,24 @@ def _detect_split_column(df: pd.DataFrame) -> str:
                     )
                 return candidate
 
-    # Last resort: scan every column for one that looks like a split label.
-    for column in df.columns:
+    # Last resort: scan plausibly split-like columns. A split column is
+    # always a low-cardinality object/string column, so we restrict the
+    # scan to those and only compute the unique-set when nunique is small
+    # — this avoids hashing 200k-row text columns like ``mzs`` or
+    # ``smiles`` on every load.
+    #
+    # ``_MAX_SPLIT_CARDINALITY`` is the largest cardinality worth
+    # considering; MassSpecGym uses 3 (train/val/test) but we leave head
+    # room in case future releases add an extra fold.
+    _MAX_SPLIT_CARDINALITY = 8
+    # Include "str" explicitly for forward-compatibility with pandas 3,
+    # which no longer treats string dtypes as a subset of "object".
+    object_columns = df.select_dtypes(
+        include=["object", "string", "str", "category"]
+    ).columns
+    for column in object_columns:
+        if df[column].nunique(dropna=True) > _MAX_SPLIT_CARDINALITY:
+            continue
         values = set(df[column].dropna().astype(str).unique())
         if _SPLIT_VALUES.issubset(values):
             logger.warning(
@@ -155,8 +171,11 @@ def load_massspecgym_tsv(
 
     split_column = _detect_split_column(df)
     if split_column != "split":
-        # Rename but keep the original so downstream users can still see it.
-        df = df.rename(columns={split_column: "split"})
+        # Copy (do not rename) so the original column remains available —
+        # downstream callers may want to inspect the source-of-truth
+        # split labels in addition to the canonical "split" alias.
+        df = df.copy()
+        df["split"] = df[split_column]
 
     return df
 
@@ -263,8 +282,16 @@ def filter_massspecgym(
 
     # Drop rows that are missing any required value. This protects the
     # filters below from edge-case NaNs; adduct/instrument NaN would
-    # otherwise short-circuit the ``isin`` check.
-    required_for_filtering = ("adduct", "precursor_mz", "smiles", "mzs")
+    # otherwise short-circuit the ``isin`` check. ``intensities`` is in
+    # the list so that spectra without intensity data can't slip through
+    # and produce NaNs downstream.
+    required_for_filtering = (
+        "adduct",
+        "precursor_mz",
+        "smiles",
+        "mzs",
+        "intensities",
+    )
     before = len(current)
     current = current.dropna(subset=list(required_for_filtering))
     dropped_nan = before - len(current)
@@ -275,9 +302,12 @@ def filter_massspecgym(
     current = current[current["adduct"].isin(adduct_set)]
     dropped_adduct = before - len(current)
 
-    # 2. Precursor m/z filter
+    # 2. Precursor m/z filter. Use pd.to_numeric(errors='coerce') so a
+    # stray non-numeric value (e.g. "NA" as a string) becomes NaN and
+    # gets dropped by the comparison, rather than raising ValueError.
     before = len(current)
-    current = current[current["precursor_mz"].astype(float) <= float(max_precursor_mz)]
+    precursor_numeric = pd.to_numeric(current["precursor_mz"], errors="coerce")
+    current = current[precursor_numeric <= float(max_precursor_mz)]
     dropped_precursor = before - len(current)
 
     # 3. SMILES length filter

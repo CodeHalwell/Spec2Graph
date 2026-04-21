@@ -41,6 +41,38 @@ class TestEigvecCache:
         assert second is not None
         np.testing.assert_array_equal(first, second)
 
+    def test_cached_file_is_a_valid_numpy_array(self, cache):
+        """Regression: _atomic_save must promote the real .npy file.
+
+        A previous bug moved the empty mkstemp placeholder into place
+        instead of the array written by np.save, leaving an empty cache
+        file that the corruption-recovery branch silently re-filled on
+        every read. Loading the file directly catches that class of bug.
+        """
+        expected = cache.get_or_compute(ETHANOL_SMILES, ETHANOL_INCHIKEY)
+        path = cache.eigvec_path(ETHANOL_INCHIKEY)
+        assert path.stat().st_size > 0, "cache file is empty"
+        loaded = np.load(path, allow_pickle=False)
+        np.testing.assert_array_equal(loaded, expected)
+
+    def test_cache_hit_does_not_recompute(self, cache, monkeypatch):
+        """A cache hit must read from disk, not invoke the processor.
+
+        If the cache silently recomputes on every call (as it did when
+        _atomic_save wrote empty files), this test catches it by making
+        any recomputation attempt raise.
+        """
+        cache.get_or_compute(ETHANOL_SMILES, ETHANOL_INCHIKEY)
+
+        def _refuse(*args, **kwargs):
+            raise RuntimeError("processor must not be called on cache hit")
+
+        monkeypatch.setattr(cache._processor, "process_smiles", _refuse)
+        # This must succeed by reading from disk; the monkeypatched
+        # processor would raise if we tried to recompute.
+        result = cache.get_or_compute(ETHANOL_SMILES, ETHANOL_INCHIKEY)
+        assert result is not None
+
     def test_cache_miss_creates_sharded_file(self, cache):
         cache.get_or_compute(ETHANOL_SMILES, ETHANOL_INCHIKEY)
         expected_path = (

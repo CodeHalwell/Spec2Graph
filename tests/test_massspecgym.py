@@ -1,14 +1,16 @@
 """Tests for :mod:`spec2graph.data.massspecgym`.
 
 Anything that hits the network (i.e. actually downloads the TSV from
-Hugging Face) is marked with ``@pytest.mark.network`` and skipped by
-default. To run the full suite, invoke::
-
-    pytest tests/ -v
-
-To skip network tests (the CI default)::
+Hugging Face) is marked with ``@pytest.mark.network``. Pytest does not
+skip marked tests automatically — CI invokes::
 
     pytest tests/ -v -m "not network"
+
+to skip them. To run only the network tests::
+
+    pytest tests/ -v -m network
+
+To run everything, omit ``-m`` entirely.
 """
 
 from __future__ import annotations
@@ -104,6 +106,24 @@ class TestLoadMassSpecGymSchema:
         # "fold" should have been renamed to "split" for downstream consistency.
         assert "split" in df.columns
         assert set(df["split"]) == {"train", "val", "test"}
+
+    def test_alternative_split_column_preserves_original(self, tmp_path, caplog):
+        # When the source column is not called "split", the loader adds a
+        # canonical "split" column while keeping the original column so
+        # downstream code can still inspect the source-of-truth labels.
+        rows = [
+            _minimal_row(fold=None) | {"subset": "train"},
+            _minimal_row(fold=None) | {"subset": "val"},
+            _minimal_row(fold=None) | {"subset": "test"},
+        ]
+        for r in rows:
+            del r["fold"]
+        tsv = _write_tsv(tmp_path / "massspecgym.tsv", rows)
+        df = load_massspecgym_tsv(local_path=tsv)
+        assert "split" in df.columns
+        assert "subset" in df.columns  # original preserved
+        # Both columns hold the same values.
+        assert list(df["split"]) == list(df["subset"])
 
     def test_alternative_split_column_name(self, tmp_path, caplog):
         rows = [
