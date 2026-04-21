@@ -78,6 +78,7 @@ class TestDataset:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
         assert len(ds) == 2
 
@@ -90,6 +91,7 @@ class TestDataset:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
         sample = ds[0]
         required = {
@@ -117,6 +119,7 @@ class TestDataset:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
         for sample in ds:
             assert sample["eigvecs"].shape[0] == sample["n_atoms"]
@@ -132,6 +135,7 @@ class TestDataset:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
         for sample in ds:
             mz = sample["mz"]
@@ -146,6 +150,7 @@ class TestDataset:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
         for sample in ds:
             if sample["intensity"].size > 0:
@@ -160,6 +165,7 @@ class TestDataset:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
         for sample in ds:
             cutoff = sample["precursor_mz"] - 0.5
@@ -175,6 +181,7 @@ class TestDataset:
             top_k_peaks=3,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
         for sample in ds:
             assert sample["mz"].size <= 3
@@ -188,6 +195,7 @@ class TestDataset:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
         for sample in ds:
             assert len(sample["atom_types"]) == sample["n_atoms"]
@@ -201,6 +209,7 @@ class TestDataset:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
             include_adjacency=True,
         )
         sample = ds[0]
@@ -213,6 +222,7 @@ class TestDataset:
                 split="training",  # typo
                 cache_dir=tmp_cache,
                 dataframe=_df(),
+                precompute=True,
             )
 
 
@@ -226,6 +236,7 @@ class TestCollator:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
         )
 
     def test_collate_produces_training_batch(self, tmp_cache: Path):
@@ -271,6 +282,7 @@ class TestCollator:
             max_peaks=16,
             fingerprint_bits=64,
             dataframe=_df(),
+            precompute=True,
             include_adjacency=True,
         )
         collator = make_metadata_collator(

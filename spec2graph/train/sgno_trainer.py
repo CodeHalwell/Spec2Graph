@@ -85,7 +85,6 @@ def adjacency_targets_from_batch(
     for i, adj in enumerate(adjacencies):
         n = min(adj.shape[0], max_atoms)
         target[i, :n, :n] = (adj[:n, :n] > threshold).astype(np.float32)
-    np.fill_diagonal_indices = np.arange(max_atoms)
     # Zero the diagonal to match the SGNO's self-loop handling.
     target[:, np.arange(max_atoms), np.arange(max_atoms)] = 0.0
 
@@ -129,11 +128,10 @@ class SGNOTrainer:
         atom_mask: torch.Tensor,
     ) -> torch.Tensor:
         # Build an edge-level mask: valid iff both endpoints are real
-        # atoms and the edge is off-diagonal.
-        edge_mask = atom_mask.unsqueeze(-1) & atom_mask.unsqueeze(-2)
-        n = atom_mask.shape[1]
-        diag = torch.eye(n, dtype=torch.bool, device=atom_mask.device)
-        edge_mask = edge_mask & ~diag
+        # atoms and the edge is off-diagonal. Zero the diagonal in-place
+        # via a view so we don't allocate an n×n identity per call.
+        edge_mask = (atom_mask.unsqueeze(-1) & atom_mask.unsqueeze(-2)).clone()
+        edge_mask.diagonal(dim1=-2, dim2=-1).fill_(False)
 
         if not edge_mask.any():
             return torch.zeros((), device=logits.device, dtype=logits.dtype)

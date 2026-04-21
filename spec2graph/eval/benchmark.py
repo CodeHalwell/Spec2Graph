@@ -98,54 +98,100 @@ def _extract_n_atoms(formula: str, fallback: int) -> int:
         return fallback
 
 
-def _sample_spectrum(
+def _sample_super_batch(
     trainer: DiffusionTrainer,
     mz: torch.Tensor,
     intensity: torch.Tensor,
-    n_samples: int,
-    n_atoms: int,
     spectrum_mask: torch.Tensor,
     precursor_mz: torch.Tensor,
+    atom_mask: torch.Tensor,
+    max_n_atoms: int,
     *,
     sampler: str,
     ddim_n_steps: int,
     ddim_eta: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Draw ``n_samples`` samples for a single spectrum.
+) -> torch.Tensor:
+    """Draw a batch of samples. Shape: ``(super_batch, max_n_atoms, k)``.
 
-    Tiles the 1-row conditioning to a length-``n_samples`` batch,
-    runs the chosen sampler, and returns ``(eigvecs, atom_mask)``.
+    Conditioning inputs are expected to already be at super-batch scale
+    — callers tile per-spectrum conditioning ``n_samples`` times and
+    concatenate across spectra before calling.
     """
-    repeated_mz = mz.expand(n_samples, -1).contiguous()
-    repeated_intensity = intensity.expand(n_samples, -1).contiguous()
-    repeated_spec_mask = spectrum_mask.expand(n_samples, -1).contiguous()
-    repeated_precursor = precursor_mz.expand(n_samples).contiguous()
-    atom_mask = torch.ones(n_samples, n_atoms, dtype=torch.bool, device=mz.device)
-
     if sampler == "ddpm":
-        eigvecs = trainer.sample(
-            repeated_mz,
-            repeated_intensity,
-            n_atoms=n_atoms,
+        return trainer.sample(
+            mz,
+            intensity,
+            n_atoms=max_n_atoms,
             atom_mask=atom_mask,
-            spectrum_mask=repeated_spec_mask,
-            precursor_mz=repeated_precursor,
+            spectrum_mask=spectrum_mask,
+            precursor_mz=precursor_mz,
         )
-    elif sampler == "ddim":
-        eigvecs = ddim_sample(
+    if sampler == "ddim":
+        return ddim_sample(
             trainer,
-            repeated_mz,
-            repeated_intensity,
-            n_atoms=n_atoms,
+            mz,
+            intensity,
+            n_atoms=max_n_atoms,
             atom_mask=atom_mask,
-            spectrum_mask=repeated_spec_mask,
-            precursor_mz=repeated_precursor,
+            spectrum_mask=spectrum_mask,
+            precursor_mz=precursor_mz,
             n_steps=ddim_n_steps,
             eta=ddim_eta,
         )
-    else:
-        raise ValueError(f"Unknown sampler {sampler!r}; expected 'ddpm' or 'ddim'.")
-    return eigvecs, atom_mask
+    raise ValueError(f"Unknown sampler {sampler!r}; expected 'ddpm' or 'ddim'.")
+
+
+def _tile_spectra(
+    samples: list[dict[str, Any]],
+    n_samples: int,
+    *,
+    known_atom_count: bool,
+    device: str | torch.device,
+) -> dict[str, torch.Tensor]:
+    """Build super-batch conditioning tensors for a set of spectra.
+
+    Each sample is tiled ``n_samples`` times so all of its candidate
+    draws share conditioning. All spectra in the batch are padded to the
+    longest peak list and the largest heavy-atom count in the batch.
+    """
+    batch_n_atoms = []
+    for sample in samples:
+        n = sample["n_atoms"]
+        if known_atom_count:
+            n = _extract_n_atoms(sample["formula"], fallback=n)
+        batch_n_atoms.append(int(n))
+    max_n_atoms = max(batch_n_atoms)
+
+    max_peaks = max(int(s["mz"].shape[0]) for s in samples)
+
+    n_spectra = len(samples)
+    super_batch = n_spectra * n_samples
+
+    mz = torch.zeros(super_batch, max_peaks, device=device, dtype=torch.float32)
+    intensity = torch.zeros_like(mz)
+    spectrum_mask = torch.zeros(super_batch, max_peaks, device=device, dtype=torch.bool)
+    atom_mask = torch.zeros(super_batch, max_n_atoms, device=device, dtype=torch.bool)
+    precursor_mz = torch.zeros(super_batch, device=device, dtype=torch.float32)
+
+    for i, sample in enumerate(samples):
+        start = i * n_samples
+        stop = start + n_samples
+        p = int(sample["mz"].shape[0])
+        mz[start:stop, :p] = torch.from_numpy(sample["mz"]).to(device)
+        intensity[start:stop, :p] = torch.from_numpy(sample["intensity"]).to(device)
+        spectrum_mask[start:stop, :p] = True
+        atom_mask[start:stop, : batch_n_atoms[i]] = True
+        precursor_mz[start:stop] = sample["precursor_mz"]
+
+    return {
+        "mz": mz,
+        "intensity": intensity,
+        "spectrum_mask": spectrum_mask,
+        "atom_mask": atom_mask,
+        "precursor_mz": precursor_mz,
+        "max_n_atoms": max_n_atoms,
+        "batch_n_atoms": batch_n_atoms,
+    }
 
 
 def benchmark_model(
@@ -192,83 +238,117 @@ def benchmark_model(
         except ImportError:
             pass
 
+    # Resumable JSONL: if the file exists, read existing idx values and
+    # skip them. New records append to the existing file. This is what
+    # the docstring advertised; "w" mode would have silently discarded
+    # prior partial runs.
+    already_done: set[int] = set()
     jsonl_handle = None
     if jsonl_path is not None:
         jsonl_path = Path(jsonl_path)
         jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-        jsonl_handle = jsonl_path.open("w")
+        if jsonl_path.exists():
+            for line in jsonl_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if isinstance(rec.get("idx"), int):
+                        already_done.add(rec["idx"])
+                        per_example.append(rec)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Skipping malformed JSONL line in %s; record will "
+                        "be overwritten on next complete run.",
+                        jsonl_path,
+                    )
+            if already_done:
+                logger.info(
+                    "Resuming: %d previously computed examples will be skipped.",
+                    len(already_done),
+                )
+        jsonl_handle = jsonl_path.open("a")
 
     trainer.model.eval()
     sgno.eval()
 
-    try:
-        for idx in iterator:
-            sample = dataset[idx]
-            gt_smiles = sample["smiles"]
-            formula = sample["formula"]
-            inchikey = sample["inchikey"]
+    # Super-batch: process ``batch_size`` spectra at a time. Each spectrum
+    # contributes ``n_samples_per_spectrum`` rows to the sampler call,
+    # padded to the common max n_atoms of its super-batch. Decoding is
+    # still per-spectrum because the ValencyDecoder is not batched.
+    batch_size = max(1, int(config.batch_size))
+    n_samples = config.n_samples_per_spectrum
 
-            n_atoms = sample["n_atoms"]
-            if config.known_atom_count:
-                n_atoms = _extract_n_atoms(formula, fallback=n_atoms)
+    pending_ids: list[int] = []
+    pending_samples: list[dict[str, Any]] = []
 
-            mz = torch.from_numpy(sample["mz"]).to(device).unsqueeze(0)
-            intensity = torch.from_numpy(sample["intensity"]).to(device).unsqueeze(0)
-            spectrum_mask = torch.ones_like(mz, dtype=torch.bool)
-            precursor_mz = torch.tensor(
-                [sample["precursor_mz"]], device=device, dtype=torch.float32
+    def _flush() -> None:
+        if not pending_samples:
+            return
+        conditioning = _tile_spectra(
+            pending_samples,
+            n_samples=n_samples,
+            known_atom_count=config.known_atom_count,
+            device=device,
+        )
+        super_eigvecs = _sample_super_batch(
+            trainer,
+            mz=conditioning["mz"],
+            intensity=conditioning["intensity"],
+            spectrum_mask=conditioning["spectrum_mask"],
+            precursor_mz=conditioning["precursor_mz"],
+            atom_mask=conditioning["atom_mask"],
+            max_n_atoms=conditioning["max_n_atoms"],
+            sampler=config.sampler,
+            ddim_n_steps=config.ddim_n_steps,
+            ddim_eta=config.ddim_eta,
+        )
+
+        super_atom_type_logits = None
+        if config.use_atom_type_head and trainer.model.atom_type_head is not None:
+            t_zero = torch.zeros(
+                super_eigvecs.shape[0], device=device, dtype=torch.long
             )
-
-            # Sample n_samples eigenvector tensors for this spectrum.
-            eigvecs, atom_masks = _sample_spectrum(
-                trainer,
-                mz,
-                intensity,
-                n_samples=config.n_samples_per_spectrum,
-                n_atoms=n_atoms,
-                spectrum_mask=spectrum_mask,
-                precursor_mz=precursor_mz,
-                sampler=config.sampler,
-                ddim_n_steps=config.ddim_n_steps,
-                ddim_eta=config.ddim_eta,
-            )
-
-            # Optional atom-type logits for the Hungarian decoder.
-            atom_type_logits = None
-            if config.use_atom_type_head and trainer.model.atom_type_head is not None:
-                t_zero = torch.zeros(
-                    config.n_samples_per_spectrum, device=device, dtype=torch.long
+            with torch.no_grad():
+                super_atom_type_logits = trainer.model.predict_atom_types(
+                    super_eigvecs,
+                    t_zero,
+                    conditioning["mz"],
+                    conditioning["intensity"],
+                    conditioning["atom_mask"],
+                    conditioning["spectrum_mask"],
+                    conditioning["precursor_mz"],
                 )
-                with torch.no_grad():
-                    atom_type_logits = trainer.model.predict_atom_types(
-                        eigvecs,
-                        t_zero,
-                        mz.expand(config.n_samples_per_spectrum, -1).contiguous(),
-                        intensity.expand(config.n_samples_per_spectrum, -1).contiguous(),
-                        atom_masks,
-                        spectrum_mask.expand(config.n_samples_per_spectrum, -1).contiguous(),
-                        precursor_mz.expand(config.n_samples_per_spectrum).contiguous(),
-                    )
 
+        # Slice the super-batch back into per-spectrum groups.
+        for i, sample in enumerate(pending_samples):
+            start = i * n_samples
+            stop = start + n_samples
+            spectrum_eigvecs = super_eigvecs[start:stop]
+            spectrum_atom_masks = conditioning["atom_mask"][start:stop]
+            spectrum_logits = (
+                super_atom_type_logits[start:stop]
+                if super_atom_type_logits is not None
+                else None
+            )
             predicted_smiles = batch_eigvecs_to_smiles(
-                eigvecs=eigvecs,
-                atom_masks=atom_masks,
-                formulas=[formula] * config.n_samples_per_spectrum,
-                atom_type_logits=atom_type_logits,
+                eigvecs=spectrum_eigvecs,
+                atom_masks=spectrum_atom_masks,
+                formulas=[sample["formula"]] * n_samples,
+                atom_type_logits=spectrum_logits,
                 sgno=sgno,
                 valency_decoder=valency_decoder,
                 threshold=config.decode_threshold,
                 max_bond_order=config.max_bond_order,
             )
-
             ranked = rank_samples_by_frequency(predicted_smiles)
-
+            gt_smiles = sample["smiles"]
             record: dict[str, Any] = {
-                "idx": idx,
-                "inchikey": inchikey,
-                "formula": formula,
+                "idx": pending_ids[i],
+                "inchikey": sample["inchikey"],
+                "formula": sample["formula"],
                 "gt_smiles": canonicalise(gt_smiles) or gt_smiles,
-                "predictions": ranked[:10],  # only keep top-10 in the log
+                "predictions": ranked[:10],
                 "top_1_accuracy": top_k_accuracy(gt_smiles, ranked, k=1),
                 "top_10_accuracy": top_k_accuracy(gt_smiles, ranked, k=10),
                 "top_1_tanimoto": top_k_tanimoto(gt_smiles, ranked, k=1),
@@ -278,13 +358,25 @@ def benchmark_model(
                 "validity": validity_rate(predicted_smiles),
             }
             per_example.append(record)
-
             if jsonl_handle is not None:
                 jsonl_handle.write(json.dumps(record) + "\n")
                 jsonl_handle.flush()
 
+        pending_ids.clear()
+        pending_samples.clear()
+
+    try:
+        for idx in iterator:
+            if idx in already_done:
+                continue
+            pending_ids.append(idx)
+            pending_samples.append(dataset[idx])
+            if len(pending_samples) >= batch_size:
+                _flush()
+        _flush()
+
         return aggregate_per_example(
-            per_example, n_samples_per_example=config.n_samples_per_spectrum
+            per_example, n_samples_per_example=n_samples
         )
     finally:
         if jsonl_handle is not None:

@@ -74,6 +74,127 @@ def _df() -> pd.DataFrame:
     return pd.DataFrame(_ROWS)
 
 
+def test_end_to_end_benchmark_super_batch(tmp_path: Path):
+    """Exercise the cross-spectrum super-batch path (batch_size > 1)."""
+    df = _df()
+    test_ds = MassSpecGymDataset(
+        split="test",
+        cache_dir=tmp_path,
+        k=4,
+        max_atoms=8,
+        max_peaks=16,
+        top_k_peaks=16,
+        fingerprint_bits=64,
+        dataframe=df,
+        precompute=True,
+    )
+    assert len(test_ds) >= 2
+
+    config = Spec2GraphDiffusionConfig(
+        d_model=16,
+        nhead=2,
+        num_encoder_layers=1,
+        num_decoder_layers=1,
+        dim_feedforward=32,
+        k=4,
+        max_atoms=8,
+        max_peaks=16,
+        dropout=0.0,
+        enable_atom_count_head=True,
+        enable_atom_type_head=True,
+    )
+    model = Spec2GraphDiffusion(config).eval()
+    trainer = DiffusionTrainer(model=model, config=TrainerConfig(n_timesteps=10))
+    sgno = SpectralGraphNeuralOperator(k=4, hidden_dim=16, num_layers=2).eval()
+
+    results = benchmark_model(
+        trainer=trainer,
+        sgno=sgno,
+        dataset=test_ds,
+        valency_decoder=ValencyDecoder(),
+        config=BenchmarkConfig(
+            n_samples_per_spectrum=2,
+            batch_size=2,          # batch across spectra
+            sampler="ddim",
+            ddim_n_steps=3,
+            progress=False,
+        ),
+        jsonl_path=tmp_path / "super_results.jsonl",
+    )
+    assert results.n_examples == len(test_ds)
+
+
+def test_benchmark_jsonl_resumes_existing_run(tmp_path: Path):
+    """A pre-existing JSONL with known idx values should be honoured."""
+    df = _df()
+    test_ds = MassSpecGymDataset(
+        split="test",
+        cache_dir=tmp_path,
+        k=4,
+        max_atoms=8,
+        max_peaks=16,
+        top_k_peaks=16,
+        fingerprint_bits=64,
+        dataframe=df,
+        precompute=True,
+    )
+
+    config = Spec2GraphDiffusionConfig(
+        d_model=16,
+        nhead=2,
+        num_encoder_layers=1,
+        num_decoder_layers=1,
+        dim_feedforward=32,
+        k=4,
+        max_atoms=8,
+        max_peaks=16,
+        dropout=0.0,
+        enable_atom_count_head=True,
+        enable_atom_type_head=True,
+    )
+    model = Spec2GraphDiffusion(config).eval()
+    trainer = DiffusionTrainer(model=model, config=TrainerConfig(n_timesteps=10))
+    sgno = SpectralGraphNeuralOperator(k=4, hidden_dim=16, num_layers=2).eval()
+
+    jsonl = tmp_path / "partial.jsonl"
+    # Seed a stub record for idx=0 so the resume logic picks it up.
+    stub_record = {
+        "idx": 0,
+        "inchikey": "STUB",
+        "formula": "?",
+        "gt_smiles": "STUB",
+        "predictions": [],
+        "top_1_accuracy": 1.0,
+        "top_10_accuracy": 1.0,
+        "top_1_tanimoto": 1.0,
+        "top_10_tanimoto": 1.0,
+        "top_1_mces": 0.0,
+        "top_10_mces": 0.0,
+        "validity": 1.0,
+    }
+    jsonl.write_text(json.dumps(stub_record) + "\n")
+
+    results = benchmark_model(
+        trainer=trainer,
+        sgno=sgno,
+        dataset=test_ds,
+        valency_decoder=ValencyDecoder(),
+        config=BenchmarkConfig(
+            n_samples_per_spectrum=2,
+            batch_size=1,
+            sampler="ddim",
+            ddim_n_steps=3,
+            progress=False,
+        ),
+        jsonl_path=jsonl,
+    )
+    # The resumed record plus any newly computed ones should cover every
+    # test example exactly once.
+    ids = [rec["idx"] for rec in results.per_example]
+    assert 0 in ids
+    assert len(set(ids)) == len(test_ds)
+
+
 def test_end_to_end_benchmark_smoke(tmp_path: Path):
     df = _df()
     train_ds = MassSpecGymDataset(
@@ -85,6 +206,7 @@ def test_end_to_end_benchmark_smoke(tmp_path: Path):
         top_k_peaks=16,
         fingerprint_bits=64,
         dataframe=df,
+        precompute=True,
         include_adjacency=True,
     )
     test_ds = MassSpecGymDataset(
@@ -94,6 +216,7 @@ def test_end_to_end_benchmark_smoke(tmp_path: Path):
         max_atoms=8,
         max_peaks=16,
         top_k_peaks=16,
+        precompute=True,
         fingerprint_bits=64,
         dataframe=df,
     )

@@ -114,6 +114,8 @@ class MassSpecGymDataset(_TorchDataset):
         download_cache_dir: Optional[str] = None,
         precompute: bool = False,
         include_adjacency: bool = False,
+        validate_cache: bool = False,
+        cache_precompute_jobs: int = -1,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError(
@@ -182,38 +184,63 @@ class MassSpecGymDataset(_TorchDataset):
             fingerprint_bits=fingerprint_bits,
         )
 
-        # Optionally prime the cache. If `precompute=False`, the dataset
-        # will still populate the cache on-the-fly during __getitem__ —
-        # useful when you trust the cache is warm and want to skip a scan.
+        # Optionally prime the cache in parallel. ``precompute=True`` is
+        # the recommended path when the cache directory is empty; it
+        # uses joblib to run eigendecomposition across workers.
         if precompute:
             self.cache.precompute_all(
                 filtered[["inchikey", "smiles"]].drop_duplicates(),
-                n_jobs=1,
+                n_jobs=cache_precompute_jobs,
                 show_progress=False,
             )
 
-        # Build the index mapping. Only keep rows where both eigenvectors
-        # and fingerprints are cacheable. Rows that fail are logged once
-        # and excluded from __len__.
+        # Build the index mapping.
+        #
+        # Two regimes:
+        #
+        # * ``validate_cache=False`` (default): check file existence via
+        #   ``has_eigvec``/``has_fingerprint`` — just a ``stat()`` per
+        #   row, which is microseconds. This assumes callers have
+        #   already primed the cache via ``precompute=True`` or the
+        #   ``prepare_data`` CLI. Rows whose cache files are missing are
+        #   dropped up-front so ``__getitem__`` never surprises us.
+        # * ``validate_cache=True``: go deeper and actually load each
+        #   cached file, re-running RDKit when the file is absent.
+        #   Slower but guarantees every row survives ``__getitem__``.
         indexable_rows: list[int] = []
-        failed: list[str] = []
+        missing: list[str] = []
         for idx, row in filtered.iterrows():
-            eigvecs = self.cache.get_or_compute(row["smiles"], row["inchikey"])
-            if eigvecs is None:
-                failed.append(row["inchikey"])
-                continue
-            fingerprint = self.cache.get_or_compute_fingerprint(
-                row["smiles"], row["inchikey"]
-            )
-            if fingerprint is None:
-                failed.append(row["inchikey"])
+            inchikey = row["inchikey"]
+            if validate_cache:
+                if self.cache.get_or_compute(row["smiles"], inchikey) is None:
+                    missing.append(inchikey)
+                    continue
+                if self.cache.get_or_compute_fingerprint(row["smiles"], inchikey) is None:
+                    missing.append(inchikey)
+                    continue
+            else:
+                if not self.cache.has_eigvec(inchikey):
+                    missing.append(inchikey)
+                    continue
+                if not self.cache.has_fingerprint(inchikey):
+                    missing.append(inchikey)
+                    continue
+            # Pre-apply the same peak filter __getitem__ uses so rows
+            # that lose all their peaks to the precursor-echo cutoff
+            # are dropped up-front rather than raising mid-epoch. This
+            # is cheap: one pass over the stringified peak list.
+            if not _has_usable_peaks_post_cutoff(row):
+                missing.append(inchikey)
                 continue
             indexable_rows.append(int(idx))
-        if failed:
-            logger.warning(
-                "MassSpecGymDataset[%s]: %d rows had uncacheable SMILES; skipping.",
+
+        if missing:
+            level = logger.warning if validate_cache else logger.info
+            level(
+                "MassSpecGymDataset[%s]: %d rows skipped (missing cache entries "
+                "or no peaks below precursor-echo cutoff).",
                 split,
-                len(failed),
+                len(missing),
             )
 
         self._df = filtered.loc[indexable_rows].reset_index(drop=True)
@@ -284,6 +311,22 @@ class MassSpecGymDataset(_TorchDataset):
             sample["adjacency"] = adjacency
 
         return sample
+
+
+def _has_usable_peaks_post_cutoff(row: pd.Series) -> bool:
+    """Return True iff the row still has peaks after the precursor-echo filter.
+
+    Mirrors the ``m/z < precursor_mz - 0.5`` rule applied in
+    :meth:`MassSpecGymDataset.__getitem__` so we can drop dead rows at
+    construction time instead of raising mid-epoch.
+    """
+    try:
+        mz = parse_peak_list(row["mzs"])
+        precursor_mz = float(row["precursor_mz"])
+    except (ValueError, SyntaxError, TypeError):
+        return False
+    cutoff = precursor_mz - 0.5
+    return bool((mz < cutoff).any())
 
 
 def _heavy_atom_count(smiles: str) -> int:

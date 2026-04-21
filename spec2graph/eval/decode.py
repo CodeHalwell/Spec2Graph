@@ -125,12 +125,17 @@ def assign_elements(
     atom_type_logits:
         Per-atom element logits. Typically the output of
         :meth:`Spec2GraphDiffusion.predict_atom_types`. Shape must be
-        ``(n_atoms, N_ELEMENT_TYPES)`` — the extra slot at
-        ``UNKNOWN_INDEX`` is safe to include; the function never assigns
-        from it because no formula slot maps to ``UNKNOWN``.
+        ``(n_atoms, N_ELEMENT_TYPES)``. The column at
+        ``UNKNOWN_INDEX`` may participate in matching: if the formula
+        contains an element that is not in the in-vocabulary set, the
+        function logs a warning, maps that formula slot to
+        ``UNKNOWN_INDEX`` for the cost matrix, and still returns the
+        original (out-of-vocab) element symbol in the output list.
     formula:
         Molecular formula string. Heavy-atom counts must equal
-        ``n_atoms``; otherwise a :class:`ValueError` is raised.
+        ``n_atoms``; otherwise a :class:`ValueError` is raised. Out-of-
+        vocabulary element symbols are allowed and trigger the UNKNOWN
+        fallback described above.
 
     Returns
     -------

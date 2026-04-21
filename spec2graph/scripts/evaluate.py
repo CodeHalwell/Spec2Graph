@@ -77,10 +77,21 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring onl
     trainer_config = TrainerConfig(**trainer_dict) if trainer_dict else TrainerConfig()
     trainer = DiffusionTrainer(model=model, config=trainer_config, device=args.device)
 
-    sgno = SpectralGraphNeuralOperator(k=config.k).to(args.device)
     if args.sgno_checkpoint is not None:
         logger.info("Loading SGNO checkpoint %s", args.sgno_checkpoint)
-        sgno_ckpt = torch.load(args.sgno_checkpoint, map_location=args.device, weights_only=False)
+        sgno_ckpt = torch.load(
+            args.sgno_checkpoint, map_location=args.device, weights_only=False
+        )
+        # Pull architectural hyperparameters from the checkpoint; fall
+        # back to SpectralGraphNeuralOperator defaults when a checkpoint
+        # pre-dates that being stored.
+        sgno_config = sgno_ckpt.get("config") or {}
+        sgno_kwargs = {"k": sgno_config.get("k", config.k)}
+        if "hidden_dim" in sgno_config:
+            sgno_kwargs["hidden_dim"] = sgno_config["hidden_dim"]
+        if "num_layers" in sgno_config:
+            sgno_kwargs["num_layers"] = sgno_config["num_layers"]
+        sgno = SpectralGraphNeuralOperator(**sgno_kwargs).to(args.device)
         sgno.load_state_dict(sgno_ckpt["model"])
     else:
         logger.warning(
@@ -88,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring onl
             "top-k accuracy will be ~0. Train an SGNO via --train-sgno in "
             "scripts.train before running a real benchmark."
         )
+        sgno = SpectralGraphNeuralOperator(k=config.k).to(args.device)
 
     dataset = MassSpecGymDataset(
         split=args.split,

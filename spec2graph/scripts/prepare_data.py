@@ -53,7 +53,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--adduct",
         action="append",
         default=None,
-        help="Adduct to keep (may be passed multiple times). Default ['M+H]+].",
+        help='Adduct to keep (may be passed multiple times). Default ("[M+H]+",).',
     )
     parser.add_argument("--max-precursor-mz", type=float, default=1000.0)
     parser.add_argument("--min-peaks", type=int, default=5)

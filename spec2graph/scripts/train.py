@@ -120,26 +120,23 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring onl
     )
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    base_collator = make_training_batch_collator(
-        max_atoms=args.max_atoms,
-        max_peaks=args.max_peaks,
-        k=args.k,
-        fingerprint_bits=args.fingerprint_bits,
-        device=args.device,
-    )
-    collator = wrap_collator_with_permutation(base_collator) if args.permute_atoms else base_collator
-
-    sgno = SGNOTrainer = None
+    # When training both the diffusion model and the SGNO, the
+    # metadata collator is the single source of truth — it carries the
+    # padded tensors via ``.batch`` and the per-sample adjacency via
+    # ``.adjacencies``. That lets a single pass over the dataloader
+    # supervise both models per batch instead of two passes per epoch.
+    sgno_module = None
+    sgno_trainer = None
     sgno_optim = None
     if args.train_sgno:
         sgno_module = SpectralGraphNeuralOperator(
             k=args.k, hidden_dim=args.sgno_hidden_dim, num_layers=args.sgno_layers
         ).to(args.device)
-        sgno = SGNOTrainer = sgno_module  # type: ignore
-        from spec2graph.train.sgno_trainer import SGNOTrainer as _SGNOTrainer
-        sgno_trainer = _SGNOTrainer(sgno_module, config=SGNOTrainerConfig(pos_weight=5.0), device=args.device)
+        sgno_trainer = SGNOTrainer(
+            sgno_module, config=SGNOTrainerConfig(pos_weight=5.0), device=args.device
+        )
         sgno_optim = torch.optim.Adam(sgno_module.parameters(), lr=args.lr)
-        eval_collator = make_metadata_collator(
+        base_collator = make_metadata_collator(
             max_atoms=args.max_atoms,
             max_peaks=args.max_peaks,
             k=args.k,
@@ -147,8 +144,32 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring onl
             device=args.device,
         )
     else:
-        sgno_trainer = None
-        eval_collator = None
+        base_collator = make_training_batch_collator(
+            max_atoms=args.max_atoms,
+            max_peaks=args.max_peaks,
+            k=args.k,
+            fingerprint_bits=args.fingerprint_bits,
+            device=args.device,
+        )
+
+    if args.permute_atoms:
+        # Permutation augmentation wraps the TrainingBatch — when the
+        # metadata collator is in use we wrap the inner ``.batch``.
+        if args.train_sgno:
+            _base_metadata_collator = base_collator
+
+            def _permuted_metadata_collator(samples):
+                collated = _base_metadata_collator(samples)
+                from spec2graph.data.augment import permute_training_batch
+
+                collated.batch = permute_training_batch(collated.batch)
+                return collated
+
+            collator = _permuted_metadata_collator
+        else:
+            collator = wrap_collator_with_permutation(base_collator)
+    else:
+        collator = base_collator
 
     loader = DataLoader(
         train_ds,
@@ -157,37 +178,47 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring onl
         collate_fn=collator,
         num_workers=args.num_workers,
     )
-    sgno_loader = None
-    if sgno_trainer is not None:
-        sgno_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=eval_collator,
-            num_workers=args.num_workers,
-        )
 
     for epoch in range(args.epochs):
         model.train()
+        if sgno_module is not None:
+            sgno_module.train()
         losses: list[float] = []
-        for step, batch in enumerate(loader):
-            loss = trainer.train_step(optim, batch)
+        sgno_losses: list[float] = []
+        for item in loader:
+            # Unify access across the two collator shapes.
+            if args.train_sgno:
+                training_batch = item.batch
+                adjacencies = item.adjacencies
+            else:
+                training_batch = item
+                adjacencies = None
+
+            # Manual backward/clip/step so grad-clip actually affects
+            # the optimiser update. trainer.train_step runs backward and
+            # optimiser.step internally, which means clipping afterward
+            # would be a no-op.
+            model.train()
+            optim.zero_grad()
+            loss_tensor = trainer.compute_loss(training_batch)
+            loss_tensor.backward()
             if args.grad_clip:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            losses.append(loss)
-        epoch_loss = sum(losses) / max(len(losses), 1)
-        logger.info("Epoch %d: train loss = %.4f", epoch + 1, epoch_loss)
+            optim.step()
+            losses.append(float(loss_tensor.item()))
 
-        if sgno_trainer is not None and sgno_loader is not None:
-            sgno_losses: list[float] = []
-            for collated in sgno_loader:
+            if sgno_trainer is not None and adjacencies is not None:
                 sl = sgno_trainer.train_step(
                     sgno_optim,
-                    collated.batch.x_0,
-                    collated.batch.atom_mask,
-                    collated.adjacencies,
+                    training_batch.x_0,
+                    training_batch.atom_mask,
+                    adjacencies,
                 )
                 sgno_losses.append(sl)
+
+        epoch_loss = sum(losses) / max(len(losses), 1)
+        logger.info("Epoch %d: train loss = %.4f", epoch + 1, epoch_loss)
+        if sgno_losses:
             logger.info(
                 "Epoch %d: sgno loss = %.4f",
                 epoch + 1,
@@ -206,12 +237,19 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring onl
             },
             checkpoint_path,
         )
-        if sgno_trainer is not None:
+        if sgno_module is not None:
             torch.save(
                 {
                     "epoch": epoch + 1,
-                    "model": sgno_module.state_dict(),  # type: ignore
+                    "model": sgno_module.state_dict(),
                     "optimizer": sgno_optim.state_dict() if sgno_optim else None,
+                    # Persist the hyperparameters so evaluate.py can
+                    # reconstruct the module with matching shapes.
+                    "config": {
+                        "k": args.k,
+                        "hidden_dim": args.sgno_hidden_dim,
+                        "num_layers": args.sgno_layers,
+                    },
                 },
                 args.output_dir / f"sgno_epoch_{epoch + 1:03d}.pt",
             )
