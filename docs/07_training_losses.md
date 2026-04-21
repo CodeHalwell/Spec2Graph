@@ -2,7 +2,7 @@
 
 Training Spec2Graph is a weighted sum of up to five loss terms. Only the
 first is required; the rest are opt-in via `TrainerConfig`
-(`spectral_diffusion.py:813`):
+(`spectral_diffusion.py:814`):
 
 ```python
 @dataclass

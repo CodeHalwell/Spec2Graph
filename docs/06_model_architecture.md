@@ -12,7 +12,7 @@ heads.
 ## Configuration
 
 Everything tunable lives in `Spec2GraphDiffusionConfig`
-(`spectral_diffusion.py:446`):
+(`spectral_diffusion.py:447`):
 
 ```python
 @dataclass

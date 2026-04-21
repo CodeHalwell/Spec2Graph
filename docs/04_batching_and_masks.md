@@ -50,7 +50,7 @@ Both are propagated through:
   decomposition, and masked rows/cols of `P_k` are zeroed out after.
 - `_pool_spectrum` — mean-pool over valid peaks only.
 - `_orthonormality_loss` — masked atoms are zeroed before computing
-  `V^T V`.
+  `VᵀV`.
 
 ## Constructing a padded batch
 
@@ -95,8 +95,8 @@ Two things worth noting:
 
 ## Alternative: build masks from sequence lengths
 
-When you have `n_atoms` and `n_peaks` as 1-D tensors, the README suggests
-the idiomatic broadcast:
+When you have `n_atoms` and `n_peaks` as 1-D tensors, use the following
+idiomatic broadcast:
 
 ```python
 atom_mask     = torch.arange(max_atoms).unsqueeze(0) < n_atoms.unsqueeze(1)
@@ -108,7 +108,7 @@ Both produce the same shape and meaning as the loop above.
 ## Packaging into a `TrainingBatch`
 
 All the tensors plus any optional targets ride in a
-`TrainingBatch` dataclass (`spectral_diffusion.py:799`):
+`TrainingBatch` dataclass (`spectral_diffusion.py:800`):
 
 ```python
 @dataclass

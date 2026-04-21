@@ -60,4 +60,4 @@ and every stage referenced below points back to specific line numbers there.
   - `k` — number of Laplacian eigenvectors kept
   - `T` — number of diffusion timesteps (`n_timesteps`, default 1000)
   - `V_k` — `(N, k)` matrix of eigenvectors
-  - `P_k = V_k V_k^T` — `(N, N)` projection onto the eigen-subspace
+  - `P_k = V_k V_kᵀ` — `(N, N)` projection onto the eigen-subspace

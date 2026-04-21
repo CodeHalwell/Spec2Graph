@@ -18,7 +18,7 @@ into one stage.
 |-------|-------|--------|
 | Data processing | SMILES string | `V_k` eigenvectors `(N, k)` |
 | Spectrum encoding | `(mz, intensity)` peak lists | Encoded memory `(B, n_peaks, d_model)` |
-| Forward diffusion | `x_0 = V_k` + timestep `t` | Noisy `x_t` + the noise `ε` |
+| Forward diffusion | `x_0 = V_k`, timestep `t` | Noisy `x_t`, noise `ε` |
 | Model forward | `x_t`, `t`, spectrum | Predicted noise `ε̂` |
 | Loss | `ε̂`, `ε`, `x_0` | Scalar loss for backprop |
 | Sampling | Random noise + spectrum | Generated `V̂_k` |
@@ -88,7 +88,7 @@ references line numbers in that file.
 Laplacian eigenvectors are **ambiguous**: a sign flip or a rotation inside a
 degenerate eigenspace yields a different `V_k` for the same graph. Regressing
 onto raw `V_k` is therefore ill-posed. Spec2Graph sidesteps this by training
-an extra loss on the **projection matrix** `P_k = V_k V_k^T`, which is
+an extra loss on the **projection matrix** `P_k = V_k V_kᵀ`, which is
 invariant under those transformations. See
 [`07_training_losses.md`](./07_training_losses.md) for the full treatment.
 
