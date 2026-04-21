@@ -459,6 +459,11 @@ class Spec2GraphDiffusionConfig:
     enable_atom_count_head: bool = False
     enable_eigenvalue_head: bool = False
     enable_precursor_conditioning: bool = False
+    # Per-atom element classifier. Reads from the decoder state so row i
+    # of the logits aligns with row i of the eigenvector output, which is
+    # what makes the Hungarian-style assignment at inference work.
+    enable_atom_type_head: bool = False
+    n_element_types: int = 13
 
 
 class Spec2GraphDiffusion(nn.Module):
@@ -561,6 +566,20 @@ class Spec2GraphDiffusion(nn.Module):
         else:
             self.eigenvalue_head = None
 
+        # Per-atom element classifier. Consumes the same decoder state that
+        # eigenvec_out projects, so the two heads' row i refer to the same
+        # atom slot. n_element_types defaults to 13 (12 elements from
+        # VALENCY_TABLE + 1 "unknown" slot); see spec2graph.data.elements.
+        self.n_element_types = config.n_element_types
+        if config.enable_atom_type_head:
+            self.atom_type_head = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU(),
+                nn.Linear(config.d_model, config.n_element_types),
+            )
+        else:
+            self.atom_type_head = None
+
         # Precursor conditioning: fuse precursor m/z into the global spectrum encoding
         self.enable_precursor_conditioning = config.enable_precursor_conditioning
         if config.enable_precursor_conditioning:
@@ -654,7 +673,7 @@ class Spec2GraphDiffusion(nn.Module):
 
         return encoded
 
-    def forward(
+    def _decode_atoms(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
@@ -664,20 +683,15 @@ class Spec2GraphDiffusion(nn.Module):
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Forward pass: predict noise given noisy eigenvectors and spectrum.
+        """Run the encoder/decoder stack and return the per-atom decoder state.
 
-        Args:
-            x_t: Noisy eigenvectors, shape (batch, n_atoms, k)
-            t: Timesteps, shape (batch,)
-            mz: m/z values, shape (batch, n_peaks)
-            intensity: Intensity values, shape (batch, n_peaks)
-            atom_mask: Boolean mask for valid atoms (True = valid), shape (batch, n_atoms)
-            spectrum_mask: Boolean mask for valid peaks (True = valid), shape (batch, n_peaks)
-            precursor_mz: Optional precursor m/z values, shape (batch,)
+        Shared by :meth:`forward` (which applies ``eigenvec_out``) and
+        :meth:`forward_with_atom_types` (which additionally applies the
+        atom-type head). Factored out so both heads see exactly the same
+        decoder output — that alignment is what lets the atom-type logits
+        at row i describe the same atom slot as the eigenvector row i.
 
-        Returns:
-            Predicted noise, shape (batch, n_atoms, k)
+        Returns a tensor of shape ``(batch, n_atoms, d_model)``.
         """
         _, n_atoms, _ = x_t.shape
 
@@ -723,12 +737,96 @@ class Spec2GraphDiffusion(nn.Module):
             tgt_key_padding_mask=tgt_key_padding_mask,
             memory_key_padding_mask=memory_key_padding_mask,
         )
-        decoded = self.decoder_norm(decoded)
+        return self.decoder_norm(decoded)
 
-        # Project back to eigenvector space
-        output = self.eigenvec_out(decoded)
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        mz: torch.Tensor,
+        intensity: torch.Tensor,
+        atom_mask: Optional[torch.Tensor] = None,
+        spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass: predict noise given noisy eigenvectors and spectrum.
 
-        return output
+        Args:
+            x_t: Noisy eigenvectors, shape (batch, n_atoms, k)
+            t: Timesteps, shape (batch,)
+            mz: m/z values, shape (batch, n_peaks)
+            intensity: Intensity values, shape (batch, n_peaks)
+            atom_mask: Boolean mask for valid atoms (True = valid), shape (batch, n_atoms)
+            spectrum_mask: Boolean mask for valid peaks (True = valid), shape (batch, n_peaks)
+            precursor_mz: Optional precursor m/z values, shape (batch,)
+
+        Returns:
+            Predicted noise, shape (batch, n_atoms, k)
+        """
+        decoded = self._decode_atoms(
+            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+        )
+        return self.eigenvec_out(decoded)
+
+    def forward_with_atom_types(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        mz: torch.Tensor,
+        intensity: torch.Tensor,
+        atom_mask: Optional[torch.Tensor] = None,
+        spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning both predicted noise and atom-type logits.
+
+        Used during training when the atom-type loss is enabled, and at
+        inference when the Hungarian assignment needs element logits. The
+        two outputs share a single decoder pass, so row ``i`` of both
+        tensors refers to the same atom slot.
+
+        Raises:
+            ValueError: if the atom-type head was not enabled on the model.
+
+        Returns:
+            Tuple ``(predicted_noise, atom_type_logits)`` with shapes
+            ``(batch, n_atoms, k)`` and ``(batch, n_atoms, n_element_types)``.
+        """
+        if self.atom_type_head is None:
+            raise ValueError(
+                "Atom-type head is disabled. Set enable_atom_type_head=True to enable."
+            )
+        decoded = self._decode_atoms(
+            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+        )
+        noise = self.eigenvec_out(decoded)
+        atom_type_logits = self.atom_type_head(decoded)
+        return noise, atom_type_logits
+
+    def predict_atom_types(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        mz: torch.Tensor,
+        intensity: torch.Tensor,
+        atom_mask: Optional[torch.Tensor] = None,
+        spectrum_mask: Optional[torch.Tensor] = None,
+        precursor_mz: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return per-atom element logits for the current ``x_t`` and spectrum.
+
+        Wrapper around :meth:`forward_with_atom_types` that discards the
+        noise output. Useful for inference code that only cares about
+        element identity (e.g. a Hungarian assignment against a known
+        molecular formula).
+
+        Returns tensor of shape ``(batch, n_atoms, n_element_types)``.
+        """
+        _, atom_type_logits = self.forward_with_atom_types(
+            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+        )
+        return atom_type_logits
 
     def _pool_spectrum(
         self, encoded: torch.Tensor, spectrum_mask: Optional[torch.Tensor] = None
@@ -808,6 +906,10 @@ class TrainingBatch:
     fingerprint_targets: Optional[torch.Tensor] = None
     atom_count_targets: Optional[torch.Tensor] = None
     eigenvalue_targets: Optional[torch.Tensor] = None
+    # Per-atom element indices in the same ordering as x_0's rows. Padded
+    # atoms carry the CrossEntropyLoss ignore_index (-100) so the loss
+    # naturally skips them. Shape: (batch, n_atoms) long.
+    atom_type_targets: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -820,6 +922,7 @@ class TrainerConfig:
     fingerprint_loss_weight: float = 0.0
     atom_count_loss_weight: float = 0.0
     eigenvalue_loss_weight: float = 0.0
+    atom_type_loss_weight: float = 0.0
 
 
 class DiffusionTrainer:
@@ -852,6 +955,7 @@ class DiffusionTrainer:
         self.fingerprint_loss_weight = config.fingerprint_loss_weight
         self.atom_count_loss_weight = config.atom_count_loss_weight
         self.eigenvalue_loss_weight = config.eigenvalue_loss_weight
+        self.atom_type_loss_weight = config.atom_type_loss_weight
 
         # DDPM schedule
         self.betas = torch.linspace(config.beta_start, config.beta_end, config.n_timesteps).to(device)
@@ -1158,6 +1262,7 @@ class DiffusionTrainer:
         fingerprint_targets = batch.fingerprint_targets
         atom_count_targets = batch.atom_count_targets
         eigenvalue_targets = batch.eigenvalue_targets
+        atom_type_targets = batch.atom_type_targets
 
         batch_size = x_0.shape[0]
 
@@ -1168,10 +1273,23 @@ class DiffusionTrainer:
         noise = torch.randn_like(x_0)
         x_t, _ = self.q_sample(x_0, t, noise)
 
-        # Predict noise
-        predicted_noise = self.model(
-            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+        # If the atom-type loss is active this step, do a single forward
+        # pass that returns both noise prediction and atom-type logits so
+        # we don't run the decoder twice.
+        atom_type_logits = None
+        atom_type_active = (
+            self.atom_type_loss_weight > 0
+            and atom_type_targets is not None
+            and self.model.atom_type_head is not None
         )
+        if atom_type_active:
+            predicted_noise, atom_type_logits = self.model.forward_with_atom_types(
+                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+            )
+        else:
+            predicted_noise = self.model(
+                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+            )
 
         # Compute loss (only on valid atoms if mask provided)
         noise_loss = self._masked_mse(
@@ -1184,6 +1302,7 @@ class DiffusionTrainer:
         fingerprint_loss = torch.tensor(0.0, device=self.device)
         atom_count_loss = torch.tensor(0.0, device=self.device)
         eigenvalue_loss = torch.tensor(0.0, device=self.device)
+        atom_type_loss = torch.tensor(0.0, device=self.device)
 
         # Reconstruct x_0 for projection and orthonormality losses
         x_0_pred = None
@@ -1234,6 +1353,17 @@ class DiffusionTrainer:
             eigenvalue_loss = F.mse_loss(eigenvalue_pred, eigenvalue_targets)
             loss = loss + self.eigenvalue_loss_weight * eigenvalue_loss
 
+        # Per-atom element classification. The logits and targets are both
+        # in the same atom ordering as x_0, so CrossEntropyLoss with
+        # ignore_index=-100 naturally skips padded atoms.
+        if atom_type_active and atom_type_logits is not None:
+            atom_type_loss = F.cross_entropy(
+                atom_type_logits.reshape(-1, atom_type_logits.shape[-1]),
+                atom_type_targets.reshape(-1),
+                ignore_index=-100,
+            )
+            loss = loss + self.atom_type_loss_weight * atom_type_loss
+
         if return_components:
             return loss, {
                 "noise": noise_loss.detach(),
@@ -1242,6 +1372,7 @@ class DiffusionTrainer:
                 "fingerprint": fingerprint_loss.detach(),
                 "atom_count": atom_count_loss.detach(),
                 "eigenvalue": eigenvalue_loss.detach(),
+                "atom_type": atom_type_loss.detach(),
             }
 
         return loss
