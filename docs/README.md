@@ -43,6 +43,11 @@ and every stage referenced below points back to specific line numbers there.
     Optional head that predicts element identity per atom slot, closing
     the atom-ordering gap between predicted eigenvectors and a real
     molecule.
+14. [14 — MassSpecGym data pipeline](./14_data_pipeline.md)
+    `spec2graph.data`: download, filter, cache, dataset, collators.
+15. [15 — MassSpecGym benchmarking](./15_benchmarking.md)
+    The de novo challenge: sampling protocol, metrics, the Hungarian
+    assignment, and the reference baselines to beat.
 
 ## Who this is for
 
