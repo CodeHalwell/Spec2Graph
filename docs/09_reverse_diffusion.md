@@ -94,9 +94,12 @@ Two pragmatic choices here:
   still predict different atom counts — they're distinguished via the
   auto-constructed `atom_mask`. Padding up to the batch max is the cheapest
   way to keep a single dense tensor.
-- **Relies on the atom-count head being trained.** If you never set
-  `enable_atom_count_head=True`, this branch raises a clear error because
-  `predict_atom_count` is `None`.
+- **Relies on the atom-count head being enabled.** `predict_atom_count`
+  always exists on the model, but if you never set
+  `enable_atom_count_head=True` it raises a `ValueError` at call time:
+  *"Atom count head is disabled. Set enable_atom_count_head=True to enable
+  predictions."* So `sample(..., n_atoms=None)` will fail fast with that
+  message rather than silently producing garbage.
 
 ### Constructing `x_T`
 

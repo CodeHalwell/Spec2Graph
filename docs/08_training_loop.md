@@ -154,9 +154,15 @@ Scaling this up to a real training script typically means adding:
 ```python
 from torch.utils.data import DataLoader
 
+def _to_device(t, device):
+    return t.to(device) if torch.is_tensor(t) else t
+
 for epoch in range(num_epochs):
-    for raw_batch in dataloader:          # your dataset yields dicts/tuples
-        batch = TrainingBatch(**raw_batch).to(device)
+    for raw_batch in dataloader:          # your dataset yields dicts of tensors
+        # TrainingBatch is a plain @dataclass with no .to() helper, so move
+        # each tensor field explicitly before constructing the batch.
+        raw_batch = {k: _to_device(v, device) for k, v in raw_batch.items()}
+        batch = TrainingBatch(**raw_batch)
         loss, comps = trainer.train_step(optimizer, batch, return_components=True)
         # log, step LR scheduler, evaluate, checkpoint, etc.
     # optional: evaluate / sample at end of epoch
