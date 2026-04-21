@@ -1009,9 +1009,14 @@ class DiffusionTrainer:
             embeddings = embeddings * mask.unsqueeze(-1).float()
         # V_k^T V_k -> (batch, k, k)
         gram = torch.bmm(embeddings.transpose(-1, -2), embeddings)
-        k = embeddings.shape[-1]
-        identity = torch.eye(k, device=embeddings.device, dtype=embeddings.dtype).unsqueeze(0)
-        return ((gram - identity) ** 2).mean()
+
+        # OPTIMIZATION: Avoid allocating O(K^2) memory for an identity matrix.
+        # Since identity matrices only contain 1s on the diagonal, we can
+        # mathematically achieve the same result by subtracting 1 from the
+        # diagonal elements of the gram matrix directly. This happens in-place
+        # because `gram` is not used elsewhere.
+        gram.diagonal(dim1=-2, dim2=-1).sub_(1.0)
+        return (gram ** 2).mean()
 
     def p_sample(
         self,
