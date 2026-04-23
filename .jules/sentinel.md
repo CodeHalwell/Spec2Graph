@@ -1,4 +1,4 @@
-## 2024-05-18 - Missing Length Bounds on RDKit Parsing and Transformer Inputs
-**Vulnerability:** External string inputs (SMILES) passed to RDKit's parser and tensor peak arrays passed to the Spec2Graph Transformer did not have upper bounds, leading to potential Denial of Service (DoS) attacks via memory exhaustion. RDKit and O(N^2) Transformer mechanisms are vulnerable to extreme inputs.
-**Learning:** In machine learning processing pipelines, memory-intensive modules (like molecular parsing and self-attention) must implement hard size limits on inputs before computation, even if downstream layers process it.
-**Prevention:** Always implement an initial size check (e.g., `len(smiles) <= MAX_LEN` or `mz.shape[1] <= max_peaks`) at the very edge of the API or forward pass method to drop excessively large payloads immediately.
+## 2025-02-20 - Insecure Deserialization in Checkpoint Loading
+**Vulnerability:** Found `torch.load` being used with `weights_only=False` when loading `args.checkpoint` and `args.sgno_checkpoint` in `spec2graph/scripts/evaluate.py`. This exposes the application to Remote Code Execution (RCE) via insecure deserialization using Python's `pickle` module if a malicious checkpoint file is loaded.
+**Learning:** PyTorch models and state dictionaries often load standard checkpoints that only contain dicts and tensors. Setting `weights_only=False` explicitly bypasses the safer, restricted unpickler. It's common in ML scripts to mistakenly set `weights_only=False` to bypass PyTorch FutureWarnings without realizing the security implications.
+**Prevention:** Always enforce `weights_only=True` in `torch.load` calls when loading untrusted checkpoint models, as standard model weights do not require arbitrary object deserialization.

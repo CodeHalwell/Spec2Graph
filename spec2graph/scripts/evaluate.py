@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring onl
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
     logger.info("Loading checkpoint %s", args.checkpoint)
-    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
     config_dict = ckpt["config"]
     trainer_dict = ckpt.get("trainer_config", {})
 
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring onl
     if args.sgno_checkpoint is not None:
         logger.info("Loading SGNO checkpoint %s", args.sgno_checkpoint)
         sgno_ckpt = torch.load(
-            args.sgno_checkpoint, map_location=args.device, weights_only=False
+            args.sgno_checkpoint, map_location=args.device, weights_only=True
         )
         # Pull architectural hyperparameters from the checkpoint; fall
         # back to SpectralGraphNeuralOperator defaults when a checkpoint
