@@ -1113,9 +1113,9 @@ class DiffusionTrainer:
             embeddings = embeddings * mask.unsqueeze(-1).float()
         # V_k^T V_k -> (batch, k, k)
         gram = torch.bmm(embeddings.transpose(-1, -2), embeddings)
-        k = embeddings.shape[-1]
-        identity = torch.eye(k, device=embeddings.device, dtype=embeddings.dtype).unsqueeze(0)
-        return ((gram - identity) ** 2).mean()
+        # Avoid O(k^2) memory allocation by subtracting 1 from the diagonal in place
+        gram.diagonal(dim1=-2, dim2=-1).sub_(1.0)
+        return (gram ** 2).mean()
 
     def p_sample(
         self,
