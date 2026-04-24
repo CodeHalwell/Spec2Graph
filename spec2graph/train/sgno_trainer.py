@@ -130,7 +130,9 @@ class SGNOTrainer:
         # Build an edge-level mask: valid iff both endpoints are real
         # atoms and the edge is off-diagonal. Zero the diagonal in-place
         # via a view so we don't allocate an n×n identity per call.
-        edge_mask = (atom_mask.unsqueeze(-1) & atom_mask.unsqueeze(-2)).clone()
+        # OPTIMIZATION: The bitwise AND creates a new boolean tensor that doesn't
+        # require gradients, so we can safely modify it in-place without .clone().
+        edge_mask = atom_mask.unsqueeze(-1) & atom_mask.unsqueeze(-2)
         edge_mask.diagonal(dim1=-2, dim2=-1).fill_(False)
 
         if not edge_mask.any():
