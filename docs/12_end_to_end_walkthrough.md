@@ -143,7 +143,7 @@ from spectral_diffusion import (
 
 # Assume the SGNO has been trained separately on (V_k, adjacency) pairs.
 sgno = SpectralGraphNeuralOperator(k=8).to(device)
-sgno.load_state_dict(torch.load("sgno.pt"))
+sgno.load_state_dict(torch.load("sgno.pt", weights_only=True))
 sgno.eval()
 
 with torch.no_grad():
@@ -175,7 +175,7 @@ from spectral_diffusion import (
 )
 
 discriminator = DenseGNNDiscriminator().to(device)
-discriminator.load_state_dict(torch.load("discriminator.pt"))
+discriminator.load_state_dict(torch.load("discriminator.pt", weights_only=True))
 discriminator.eval()
 
 guided = GuidedDiffusionSampler(
