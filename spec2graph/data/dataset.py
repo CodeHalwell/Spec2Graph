@@ -78,6 +78,8 @@ def _atom_symbols_from_smiles(smiles: str) -> Optional[list[str]]:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
+    if mol.GetNumAtoms() == 0:
+        return None
     return [atom.GetSymbol() for atom in mol.GetAtoms()]
 
 
