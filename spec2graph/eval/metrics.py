@@ -55,6 +55,8 @@ def canonicalise(smiles: Optional[str]) -> Optional[str]:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
+    if mol.GetNumAtoms() == 0:
+        return None
     try:
         return Chem.MolToSmiles(mol)
     except (ValueError, RuntimeError):
@@ -97,6 +99,8 @@ def _morgan_fp(smiles: str, radius: int = 2, n_bits: int = 2048):
 
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
+        return None
+    if mol.GetNumAtoms() == 0:
         return None
     return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
 
