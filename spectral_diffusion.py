@@ -510,6 +510,11 @@ class Spec2GraphDiffusion(nn.Module):
 
         # Positional embeddings for atoms
         self.atom_pos_embedding = nn.Embedding(config.max_atoms, config.d_model)
+        self.register_buffer(
+            "positions",
+            torch.arange(config.max_atoms, dtype=torch.long),
+            persistent=False,
+        )
 
         # Transformer encoder for spectrum
         encoder_layer = nn.TransformerEncoderLayer(
@@ -713,7 +718,7 @@ class Spec2GraphDiffusion(nn.Module):
         x_emb = self.eigenvec_in(x_t)  # (batch, n_atoms, d_model)
 
         # Add positional embeddings
-        positions = torch.arange(n_atoms, device=x_t.device)
+        positions = self.positions[:n_atoms]
         pos_emb = self.atom_pos_embedding(positions)  # (n_atoms, d_model)
         x_emb = x_emb + pos_emb
 
