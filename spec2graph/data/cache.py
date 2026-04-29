@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Iterable, Optional
@@ -92,6 +93,10 @@ class EigenvectorCache:
         if not inchikey or len(inchikey) < 2:
             raise ValueError(
                 f"InChIKey must have length >= 2 for sharding; got {inchikey!r}."
+            )
+        if not re.match(r"^[A-Z0-9\-]+$", inchikey, flags=re.IGNORECASE):
+            raise ValueError(
+                f"Invalid characters in InChIKey {inchikey!r}. Potential path traversal."
             )
         return inchikey[:2].upper()
 
