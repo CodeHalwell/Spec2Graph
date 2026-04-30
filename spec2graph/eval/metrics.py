@@ -201,8 +201,19 @@ def top_k_tanimoto(
     Returns ``0.0`` if ``predictions`` is empty or all invalid.
     """
     best = 0.0
+
+    # OPTIMIZATION: Precompute the ground truth fingerprint outside the loop
+    # to avoid redundant O(N) RDKit parsing and fingerprint generation for the same molecule.
+    from rdkit import DataStructs
+    fp_gt = _morgan_fp(gt_smiles, radius=radius, n_bits=n_bits)
+    if fp_gt is None:
+        return best
+
     for pred in predictions[:k]:
-        sim = tanimoto_similarity(gt_smiles, pred, radius=radius, n_bits=n_bits)
+        fp_pred = _morgan_fp(pred, radius=radius, n_bits=n_bits)
+        if fp_pred is None:
+            continue
+        sim = DataStructs.TanimotoSimilarity(fp_gt, fp_pred)
         if sim > best:
             best = sim
     return best
