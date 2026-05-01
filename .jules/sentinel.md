@@ -12,3 +12,8 @@
 **Vulnerability:** Found `inchikey` inputs from external datasets used directly to build cache directory and file paths (`inchikey[:2]` and `{inchikey}.npy`) in `spec2graph/data/cache.py` without proper input validation. This allows arbitrary file writes or reads outside the cache directory via path traversal (e.g., `../../etc/passwd`).
 **Learning:** Even identifiers sourced from supposedly structured datasets (like TSVs) should not be trusted if they are used in file paths. Malicious modification of the dataset could exploit downstream cache-generation logic.
 **Prevention:** Always validate external identifiers used in file paths against a strict allowed-character format (e.g., via regex `^[A-Z0-9\-]+$`) before appending them to file paths.
+
+## 2025-02-22 - Denial of Service via Memory Exhaustion in String Parsing
+**Vulnerability:** Found `ast.literal_eval` parsing arbitrarily long stringified lists of mass spectrum peaks (`mzs` and `intensities`) from the MassSpecGym dataset in `spec2graph/data/massspecgym.py`. Passing an extremely large string could lead to CPU/Memory exhaustion and cause a Denial of Service (DoS) attack.
+**Learning:** While `ast.literal_eval` safely prevents Remote Code Execution (RCE) compared to `eval`, it does not inherently protect against memory or CPU exhaustion if the payload size is unbounded. External data sources (like public datasets) can contain maliciously large payloads to exploit these parsers.
+**Prevention:** Always enforce a strict hard length limit check (e.g., `len(value) > 100000`) before parsing any stringified Python literals with `ast.literal_eval` to prevent DoS via memory/CPU exhaustion.
