@@ -1583,10 +1583,11 @@ class DenseGNNLayer(nn.Module):
         # Degree normalisation: D^{-1/2} A D^{-1/2}
         degree = adj.sum(dim=-1, keepdim=True).clamp(min=PROJECTION_EPS)
         degree_inv_sqrt = torch.rsqrt(degree)
-        # Normalised message passing
-        adj_norm = adj * degree_inv_sqrt * degree_inv_sqrt.transpose(-1, -2)
-        # Aggregate messages
-        agg = torch.bmm(adj_norm, x)
+        # Normalised message passing: D^{-1/2} A D^{-1/2} x
+        # Optimize by avoiding materialization of O(N^2) dense normalized adjacency matrix
+        x_scaled = x * degree_inv_sqrt
+        agg = torch.bmm(adj, x_scaled)
+        agg = agg * degree_inv_sqrt
         out = self.linear(agg)
         return F.relu(self.norm(out))
 

@@ -12,3 +12,6 @@
 ## 2024-05-26 - Avoid negligible micro-optimizations on small tensors
 **Learning:** Replacing a one-off `torch.arange(N, device=device)` call with a slice of a pre-allocated tensor buffer `positions[:N]` when `N` is small and the call happens only once per forward pass (not deep in a heavy loop) is a negligible micro-optimization. Furthermore, blindly slicing pre-allocated positional buffers is unsafe due to potential shape and semantic mismatches.
 **Action:** Do not implement micro-optimizations that offer no measurable impact or require unsafe assumptions about model properties. Focus on $O(N)$ vs $O(N^2)$ structural bottlenecks or redundant computations.
+## 2025-02-20 - [GNN Adjacency Normalization Optimization]
+**Learning:** In PyTorch GNNs, when aggregating features using a dense normalized adjacency matrix (e.g., `D^{-1/2} A D^{-1/2} X`), computing `adj_norm = adj * D_inv_sqrt * D_inv_sqrt.transpose()` forces an O(N^2) memory allocation and broadcasting overhead.
+**Action:** Use the associative property of matrix multiplication to rewrite it as `D^{-1/2} (A (D^{-1/2} X))`. First scale features (`x_scaled = x * D_inv_sqrt`), perform message passing `torch.bmm(adj, x_scaled)`, and finally scale the output `agg = agg * D_inv_sqrt`. This avoids the O(N^2) dense matrix and saves significant time and memory.
