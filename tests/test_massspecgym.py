@@ -88,6 +88,12 @@ class TestParsePeakList:
         with pytest.raises(ValueError):
             parse_peak_list("__import__('os')")
 
+    def test_rejects_overlong_string(self):
+        overlong = "[" + "1.0, " * 25000 + "1.0]"
+        assert len(overlong) > 100000
+        with pytest.raises(ValueError, match="exceeds maximum allowed length"):
+            parse_peak_list(overlong)
+
 
 # ----------------------------------------------------------------------
 # load_massspecgym_tsv — schema validation via local_path

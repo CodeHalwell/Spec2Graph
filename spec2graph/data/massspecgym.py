@@ -200,6 +200,10 @@ def parse_peak_list(value: object) -> np.ndarray:
             f"Cannot parse peak list of type {type(value).__name__}; "
             "expected str, list, tuple or ndarray."
         )
+    if len(value) > 100000:
+        raise ValueError(
+            f"Peak list string exceeds maximum allowed length of 100000 characters (got {len(value)})."
+        )
     parsed = ast.literal_eval(value)
     if not isinstance(parsed, (list, tuple)):
         raise ValueError(
