@@ -139,11 +139,15 @@ class SpectralDataProcessor:
         # Avoid division by zero using epsilon for numerical stability
         eps = 1e-12
         degree_inv_sqrt = np.where(degree > eps, 1.0 / np.sqrt(degree), 0.0)
-        D_inv_sqrt = np.diag(degree_inv_sqrt)
+
+        # OPTIMIZATION: Avoid materializing the O(N^2) identity matrix via np.eye
+        # and avoid O(N^3) dense matrix multiplication. Use O(N^2) numpy broadcasting
+        # to compute the normalized adjacency matrix directly.
+        norm_adj = adjacency * degree_inv_sqrt[:, None] * degree_inv_sqrt[None, :]
 
         # Normalized Laplacian: I - D^(-1/2) A D^(-1/2)
-        identity = np.eye(adjacency.shape[0])
-        laplacian = identity - D_inv_sqrt @ adjacency @ D_inv_sqrt
+        laplacian = -norm_adj
+        np.fill_diagonal(laplacian, laplacian.diagonal() + 1.0)
 
         return laplacian
 
