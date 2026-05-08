@@ -15,3 +15,6 @@
 ## 2025-02-20 - [GNN Adjacency Normalization Optimization]
 **Learning:** In PyTorch GNNs, when aggregating features using a dense normalized adjacency matrix (e.g., `D^{-1/2} A D^{-1/2} X`), computing `adj_norm = adj * D_inv_sqrt * D_inv_sqrt.transpose()` forces an O(N^2) memory allocation and broadcasting overhead.
 **Action:** Use the associative property of matrix multiplication to rewrite it as `D^{-1/2} (A (D^{-1/2} X))`. First scale features (`x_scaled = x * D_inv_sqrt`), perform message passing `torch.bmm(adj, x_scaled)`, and finally scale the output `agg = agg * D_inv_sqrt`. This avoids the O(N^2) dense matrix and saves significant time and memory.
+## 2025-02-21 - [Diffusion Loop Redundant Computation]
+**Learning:** In diffusion models, passing static context (like `mz` and `intensity` spectrum features) repeatedly to the denoiser during the reverse sampling loop causes redundant encoding (O(N) operations per timestep) if the encoder is invoked inside `forward`. For 1000 timesteps, this wastes significant computation.
+**Action:** When context features are static across diffusion timesteps, precompute their embeddings outside the reverse diffusion loop (e.g., `memory = encode(...)`) and pass the precomputed `memory` to the denoiser in the loop. Update the denoiser's `forward` to accept and use this optional `memory`.

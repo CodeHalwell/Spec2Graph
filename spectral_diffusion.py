@@ -693,6 +693,7 @@ class Spec2GraphDiffusion(nn.Module):
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
+        memory: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the encoder/decoder stack and return the per-atom decoder state.
 
@@ -712,8 +713,9 @@ class Spec2GraphDiffusion(nn.Module):
                 "Increase max_atoms or truncate input."
             )
 
-        # Encode spectrum
-        memory = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
+        # Encode spectrum if memory is not already provided
+        if memory is None:
+            memory = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
 
         # Get timestep embedding
         t_emb = self.time_embedding(t)  # (batch, d_model)
@@ -759,6 +761,7 @@ class Spec2GraphDiffusion(nn.Module):
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
+        memory: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass: predict noise given noisy eigenvectors and spectrum.
@@ -776,7 +779,7 @@ class Spec2GraphDiffusion(nn.Module):
             Predicted noise, shape (batch, n_atoms, k)
         """
         decoded = self._decode_atoms(
-            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz, memory=memory
         )
         return self.eigenvec_out(decoded)
 
@@ -789,6 +792,7 @@ class Spec2GraphDiffusion(nn.Module):
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
+        memory: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass returning both predicted noise and atom-type logits.
 
@@ -809,7 +813,7 @@ class Spec2GraphDiffusion(nn.Module):
                 "Atom-type head is disabled. Set enable_atom_type_head=True to enable."
             )
         decoded = self._decode_atoms(
-            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+            x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz, memory=memory
         )
         noise = self.eigenvec_out(decoded)
         atom_type_logits = self.atom_type_head(decoded)
@@ -1137,6 +1141,7 @@ class DiffusionTrainer:
         atom_mask: Optional[torch.Tensor] = None,
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
+        memory: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample from p(x_{t-1} | x_t).
@@ -1159,7 +1164,7 @@ class DiffusionTrainer:
         # Predict noise
         with torch.no_grad():
             predicted_noise = self.model(
-                x_t, t_tensor, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+                x_t, t_tensor, mz, intensity, atom_mask, spectrum_mask, precursor_mz, memory=memory
             )
 
         # Compute x_{t-1}
@@ -1241,10 +1246,13 @@ class DiffusionTrainer:
             # Start from pure noise
             x_t = torch.randn(batch_size, n_atoms, k, device=self.device)
 
+        # Precompute spectrum embeddings once to avoid redundant O(N) re-encoding in the reverse diffusion loop
+        memory = self.model.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
+
         # Reverse diffusion
         for t in reversed(range(self.n_timesteps)):
             x_t = self.p_sample(
-                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz, memory=memory
             )
 
         return x_t
@@ -1716,6 +1724,9 @@ class GuidedDiffusionSampler:
         # Start from pure noise
         x_t = torch.randn(batch_size, n_atoms, k, device=device)
 
+        # Precompute spectrum embeddings once to avoid redundant O(N) re-encoding in the reverse diffusion loop
+        memory = self.trainer.model.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
+
         for t in reversed(range(self.trainer.n_timesteps)):
             t_tensor = torch.full(
                 (batch_size,), t, device=device, dtype=torch.long
@@ -1731,6 +1742,7 @@ class GuidedDiffusionSampler:
                     atom_mask,
                     spectrum_mask,
                     precursor_mz,
+                    memory=memory,
                 )
 
             # Compute reverse mean
@@ -1757,6 +1769,7 @@ class GuidedDiffusionSampler:
                     atom_mask,
                     spectrum_mask,
                     precursor_mz,
+                    memory=memory,
                 )
                 x0_hat = DiffusionTrainer._safe_divide(
                     x_t_grad - sqrt_one_minus * eps_for_tweedie, sqrt_alpha_bar
