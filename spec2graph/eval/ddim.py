@@ -135,6 +135,9 @@ def ddim_sample(
     if x_t is None:
         x_t = torch.randn(batch_size, n_atoms, k, device=device)
 
+    # Precompute spectrum embeddings once to avoid redundant O(N) re-encoding in the reverse diffusion loop
+    memory = model.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
+
     # ------------------------------------------------------------------
     # DDIM reverse loop
     # ------------------------------------------------------------------
@@ -146,7 +149,7 @@ def ddim_sample(
 
         t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
         eps_pred = model(
-            x_t, t_tensor, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+            x_t, t_tensor, mz, intensity, atom_mask, spectrum_mask, precursor_mz, memory=memory
         )
 
         a_t = alpha_cumprod[t]
