@@ -28,6 +28,8 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+from spectral_diffusion import MAX_SMILES_LENGTH
+
 logger = logging.getLogger(__name__)
 
 # MCES returns a "large" distance for graphs that cannot be matched within
@@ -46,7 +48,7 @@ def canonicalise(smiles: Optional[str]) -> Optional[str]:
     ``None`` input and unparseable strings both return ``None`` so
     callers can uniformly treat failed predictions as invalid.
     """
-    if smiles is None:
+    if smiles is None or len(smiles) > MAX_SMILES_LENGTH:
         return None
     try:
         from rdkit import Chem
@@ -94,6 +96,9 @@ def rank_samples_by_frequency(
 
 
 def _morgan_fp(smiles: str, radius: int = 2, n_bits: int = 2048):
+    if len(smiles) > MAX_SMILES_LENGTH:
+        return None
+
     from rdkit import Chem
     from rdkit.Chem import AllChem
 

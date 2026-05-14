@@ -20,6 +20,8 @@ from typing import Any, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from spectral_diffusion import MAX_SMILES_LENGTH
+
 from spec2graph.data.cache import EigenvectorCache
 from spec2graph.data.elements import atom_types_to_indices
 from spec2graph.data.massspecgym import (
@@ -44,6 +46,9 @@ def _adjacency_from_smiles(smiles: str) -> Optional[np.ndarray]:
     matches the RDKit canonical ordering, which in turn matches the
     ordering used for eigenvector computation.
     """
+    if len(smiles) > MAX_SMILES_LENGTH:
+        return None
+
     try:
         from rdkit import Chem
     except ImportError as exc:
@@ -70,6 +75,9 @@ def _adjacency_from_smiles(smiles: str) -> Optional[np.ndarray]:
 
 def _atom_symbols_from_smiles(smiles: str) -> Optional[list[str]]:
     """Return a list of element symbols in RDKit canonical order."""
+    if len(smiles) > MAX_SMILES_LENGTH:
+        return None
+
     try:
         from rdkit import Chem
     except ImportError as exc:
@@ -333,6 +341,9 @@ def _has_usable_peaks_post_cutoff(row: pd.Series) -> bool:
 
 def _heavy_atom_count(smiles: str) -> int:
     """Return the number of heavy atoms or 0 if RDKit can't parse."""
+    if len(smiles) > MAX_SMILES_LENGTH:
+        return 0
+
     try:
         from rdkit import Chem
     except ImportError:
