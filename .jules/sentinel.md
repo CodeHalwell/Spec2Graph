@@ -17,3 +17,8 @@
 **Vulnerability:** Found `ast.literal_eval` parsing arbitrarily long stringified lists of mass spectrum peaks (`mzs` and `intensities`) from the MassSpecGym dataset in `spec2graph/data/massspecgym.py`. Passing an extremely large string could lead to CPU/Memory exhaustion and cause a Denial of Service (DoS) attack.
 **Learning:** While `ast.literal_eval` safely prevents Remote Code Execution (RCE) compared to `eval`, it does not inherently protect against memory or CPU exhaustion if the payload size is unbounded. External data sources (like public datasets) can contain maliciously large payloads to exploit these parsers.
 **Prevention:** Always enforce a strict hard length limit check (e.g., `len(value) > 100000`) before parsing any stringified Python literals with `ast.literal_eval` to prevent DoS via memory/CPU exhaustion.
+
+## 2023-10-27 - Fix DoS via unbounded SMILES parsing
+**Vulnerability:** SMILES parsing via `Chem.MolFromSmiles(smiles)` lacked a strict length limit in `spec2graph/data/dataset.py` and `spec2graph/eval/metrics.py`, which could allow malicious inputs to trigger excessive CPU/Memory consumption (DoS).
+**Learning:** Pathological strings passed to external C++ binding libraries can cause O(N^3) complexity operations. Hard length limits on strings must be checked immediately before external library boundaries.
+**Prevention:** Enforce a strict length limit (e.g., checking against `MAX_SMILES_LENGTH` = 2000) on all external inputs before passing them to external dependencies like RDKit.
