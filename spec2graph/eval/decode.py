@@ -57,6 +57,8 @@ _HYDROGEN = "H"
 # this list is sorted alphabetically at the end.
 _STANDARD_ORDER = ("C", "N", "O", "S", "P", "F", "Cl", "Br", "I", "Si", "B", "Se")
 
+MAX_FORMULA_LENGTH = 1000
+
 
 def parse_formula(formula: str) -> dict[str, int]:
     """Parse a molecular formula like ``'C17H26ClNO2'`` into a counts dict.
@@ -71,6 +73,10 @@ def parse_formula(formula: str) -> dict[str, int]:
     """
     if not formula:
         raise ValueError("formula is empty.")
+    if len(formula) > MAX_FORMULA_LENGTH:
+        raise ValueError(
+            f"Formula string exceeds maximum allowed length of {MAX_FORMULA_LENGTH} characters."
+        )
     counts: dict[str, int] = {}
     for symbol, count_str in _FORMULA_TOKEN.findall(formula):
         if not symbol:
