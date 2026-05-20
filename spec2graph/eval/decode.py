@@ -71,6 +71,8 @@ def parse_formula(formula: str) -> dict[str, int]:
     """
     if not formula:
         raise ValueError("formula is empty.")
+    if len(formula) > 1000:
+        raise ValueError(f"formula exceeds maximum allowed length of 1000 characters (got {len(formula)}).")
     counts: dict[str, int] = {}
     for symbol, count_str in _FORMULA_TOKEN.findall(formula):
         if not symbol:

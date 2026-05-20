@@ -22,3 +22,8 @@
 **Vulnerability:** SMILES parsing via `Chem.MolFromSmiles(smiles)` lacked a strict length limit in `spec2graph/data/dataset.py` and `spec2graph/eval/metrics.py`, which could allow malicious inputs to trigger excessive CPU/Memory consumption (DoS).
 **Learning:** Pathological strings passed to external C++ binding libraries can cause O(N^3) complexity operations. Hard length limits on strings must be checked immediately before external library boundaries.
 **Prevention:** Enforce a strict length limit (e.g., checking against `MAX_SMILES_LENGTH` = 2000) on all external inputs before passing them to external dependencies like RDKit.
+
+## 2025-05-24 - DoS Vulnerability in `parse_formula` via Regex and Long String Count Exhaustion
+**Vulnerability:** Found `parse_formula` parsing arbitrarily long formula strings (e.g., `C9999999999999999999`) from MassSpecGym TSV dataset. Extremely large string lengths lead to Denial of Service (DoS) attacks through memory/CPU exhaustion when extracting counts and propagating them to lists using python string multiplication operators.
+**Learning:** Even though `parse_formula` uses a simple and seemingly safe regular expression (`[A-Z][a-z]?\d*`), parsing excessively long integers from external inputs without limits can lead to `OverflowError` or CPU/memory exhaustion when these values are used in subsequent computations like `ordered.extend([element] * counts[element])`.
+**Prevention:** When parsing stringified counts or multipliers from external inputs (like chemical formulas), enforce both a maximum string length and a maximum parsed integer/count limit to prevent memory exhaustion (DoS) during subsequent list expansions.
