@@ -71,6 +71,8 @@ def parse_formula(formula: str) -> dict[str, int]:
     """
     if not formula:
         raise ValueError("formula is empty.")
+    if len(formula) > 2000:
+        raise ValueError(f"Formula string exceeds maximum allowed length of 2000 characters (got {len(formula)}).")
     counts: dict[str, int] = {}
     for symbol, count_str in _FORMULA_TOKEN.findall(formula):
         if not symbol:
@@ -78,6 +80,8 @@ def parse_formula(formula: str) -> dict[str, int]:
         if symbol == _HYDROGEN:
             continue
         count = int(count_str) if count_str else 1
+        if count > 10000:
+            raise ValueError(f"Parsed atom count for {symbol} exceeds maximum allowed limit of 10000 (got {count}).")
         counts[symbol] = counts.get(symbol, 0) + count
     if not counts:
         raise ValueError(f"No heavy-atom tokens in formula {formula!r}.")
