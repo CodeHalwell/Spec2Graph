@@ -859,11 +859,13 @@ class Spec2GraphDiffusion(nn.Module):
         intensity: torch.Tensor,
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
+        encoded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict fingerprint logits from spectrum input."""
         if self.fingerprint_head is None:
             raise ValueError("Fingerprint head is disabled. Set fingerprint_dim>0 to enable.")
-        encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
+        if encoded is None:
+            encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
         pooled = self._pool_spectrum(encoded, spectrum_mask)
         return self.fingerprint_head(pooled)
 
@@ -873,13 +875,15 @@ class Spec2GraphDiffusion(nn.Module):
         intensity: torch.Tensor,
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
+        encoded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict atom count (regression logit) from spectrum input."""
         if self.atom_count_head is None:
             raise ValueError(
                 "Atom count head is disabled. Set enable_atom_count_head=True to enable predictions."
             )
-        encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
+        if encoded is None:
+            encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
         pooled = self._pool_spectrum(encoded, spectrum_mask)
         return self.atom_count_head(pooled).squeeze(-1)
 
@@ -889,6 +893,7 @@ class Spec2GraphDiffusion(nn.Module):
         intensity: torch.Tensor,
         spectrum_mask: Optional[torch.Tensor] = None,
         precursor_mz: Optional[torch.Tensor] = None,
+        encoded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict Laplacian eigenvalues from spectrum input (Phase 4).
 
@@ -904,7 +909,8 @@ class Spec2GraphDiffusion(nn.Module):
             raise ValueError(
                 "Eigenvalue head is disabled. Set enable_eigenvalue_head=True to enable predictions."
             )
-        encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
+        if encoded is None:
+            encoded = self.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
         pooled = self._pool_spectrum(encoded, spectrum_mask)
         return self.eigenvalue_head(pooled)
 
@@ -1350,16 +1356,27 @@ class DiffusionTrainer:
             ortho_loss = self._orthonormality_loss(x_0_pred, atom_mask)
             loss = loss + self.orthonormality_loss_weight * ortho_loss
 
+        # Encode spectrum once for all auxiliary heads
+        encoded_spectrum = None
+        if (
+            (self.fingerprint_loss_weight > 0 and fingerprint_targets is not None)
+            or (self.atom_count_loss_weight > 0 and atom_count_targets is not None)
+            or (self.eigenvalue_loss_weight > 0 and eigenvalue_targets is not None)
+        ):
+            encoded_spectrum = self.model.encode_spectrum(
+                mz, intensity, spectrum_mask, precursor_mz
+            )
+
         if self.fingerprint_loss_weight > 0 and fingerprint_targets is not None:
             fp_logits = self.model.predict_fingerprint(
-                mz, intensity, spectrum_mask, precursor_mz
+                mz, intensity, spectrum_mask, precursor_mz, encoded=encoded_spectrum
             )
             fingerprint_loss = F.binary_cross_entropy_with_logits(fp_logits, fingerprint_targets)
             loss = loss + self.fingerprint_loss_weight * fingerprint_loss
 
         if self.atom_count_loss_weight > 0 and atom_count_targets is not None:
             atom_pred = self.model.predict_atom_count(
-                mz, intensity, spectrum_mask, precursor_mz
+                mz, intensity, spectrum_mask, precursor_mz, encoded=encoded_spectrum
             )
             atom_count_loss = F.mse_loss(atom_pred, atom_count_targets.float())
             loss = loss + self.atom_count_loss_weight * atom_count_loss
@@ -1367,7 +1384,7 @@ class DiffusionTrainer:
         # Phase 4: Eigenvalue prediction loss
         if self.eigenvalue_loss_weight > 0 and eigenvalue_targets is not None:
             eigenvalue_pred = self.model.predict_eigenvalues(
-                mz, intensity, spectrum_mask, precursor_mz
+                mz, intensity, spectrum_mask, precursor_mz, encoded=encoded_spectrum
             )
             eigenvalue_loss = F.mse_loss(eigenvalue_pred, eigenvalue_targets)
             loss = loss + self.eigenvalue_loss_weight * eigenvalue_loss
