@@ -67,17 +67,29 @@ def parse_formula(formula: str) -> dict[str, int]:
     Raises
     ------
     ValueError
-        If ``formula`` is empty or contains no parseable element tokens.
+        If ``formula`` is empty, contains no parseable element tokens,
+        is excessively long, or describes an unreasonably large molecule.
     """
     if not formula:
         raise ValueError("formula is empty.")
+    if len(formula) > 100000:
+        raise ValueError(
+            f"Formula string exceeds maximum allowed length of 100000 characters (got {len(formula)})."
+        )
     counts: dict[str, int] = {}
+    total_atoms = 0
     for symbol, count_str in _FORMULA_TOKEN.findall(formula):
         if not symbol:
             continue
         if symbol == _HYDROGEN:
             continue
         count = int(count_str) if count_str else 1
+        total_atoms += count
+        if total_atoms > 100000:
+            raise ValueError(
+                "Parsed formula describes a molecule with more than 100000 atoms, "
+                "which is not supported."
+            )
         counts[symbol] = counts.get(symbol, 0) + count
     if not counts:
         raise ValueError(f"No heavy-atom tokens in formula {formula!r}.")
