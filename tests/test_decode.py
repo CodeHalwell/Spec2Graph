@@ -45,6 +45,14 @@ class TestParseFormula:
         with pytest.raises(ValueError, match="No heavy-atom tokens"):
             parse_formula("H2")
 
+    def test_excessive_length_raises(self):
+        with pytest.raises(ValueError, match="exceeds maximum allowed length"):
+            parse_formula("C" * 100001)
+
+    def test_excessive_atoms_raises(self):
+        with pytest.raises(ValueError, match="more than 100000 atoms"):
+            parse_formula("C100001")
+
 
 class TestFormulaToAtomTypes:
     def test_ethanol(self):
