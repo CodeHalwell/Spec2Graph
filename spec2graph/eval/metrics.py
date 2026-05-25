@@ -133,7 +133,7 @@ def tanimoto_similarity(
 
 
 def mces_distance(
-    smiles_a: str,
+    smiles_a: str | "rdkit.Chem.Mol",
     smiles_b: str,
     *,
     threshold: float = 10.0,
@@ -238,8 +238,20 @@ def top_k_mces(
     if not predictions:
         return MCES_SENTINEL_DISTANCE
     best = MCES_SENTINEL_DISTANCE
+
+    # OPTIMIZATION: Precompute the ground truth Mol object outside the loop
+    # to avoid redundant O(N) RDKit parsing for the same molecule inside myopic_mces.MCES.
+    try:
+        from rdkit import Chem
+        gt_mol = Chem.MolFromSmiles(gt_smiles)
+        if gt_mol is None:
+            # Fall back to str if parsing fails to avoid crashing unexpectedly
+            gt_mol = gt_smiles
+    except ImportError:
+        gt_mol = gt_smiles
+
     for pred in predictions[:k]:
-        d = mces_distance(gt_smiles, pred, threshold=threshold)
+        d = mces_distance(gt_mol, pred, threshold=threshold)
         if d < best:
             best = d
     return best
