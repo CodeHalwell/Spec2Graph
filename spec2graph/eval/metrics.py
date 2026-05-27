@@ -20,6 +20,7 @@ silent under-counting in naive implementations.
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import logging
 from collections import Counter
@@ -42,6 +43,7 @@ MCES_SENTINEL_DISTANCE: float = 100.0
 # ----------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=4096)
 def canonicalise(smiles: Optional[str]) -> Optional[str]:
     """Return the RDKit-canonical form of ``smiles`` or ``None``.
 
@@ -95,19 +97,21 @@ def rank_samples_by_frequency(
 # ----------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=4096)
 def _morgan_fp(smiles: str, radius: int = 2, n_bits: int = 2048):
     if len(smiles) > MAX_SMILES_LENGTH:
         return None
 
     from rdkit import Chem
-    from rdkit.Chem import AllChem
+    from rdkit.Chem import rdFingerprintGenerator
 
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
     if mol.GetNumAtoms() == 0:
         return None
-    return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+    gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
+    return gen.GetFingerprint(mol)
 
 
 def tanimoto_similarity(
