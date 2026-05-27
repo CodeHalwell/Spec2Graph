@@ -248,20 +248,21 @@ def benchmark_model(
         jsonl_path = Path(jsonl_path)
         jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         if jsonl_path.exists():
-            for line in jsonl_path.read_text().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    rec = json.loads(line)
-                    if isinstance(rec.get("idx"), int):
-                        already_done.add(rec["idx"])
-                        per_example.append(rec)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "Skipping malformed JSONL line in %s; record will "
-                        "be overwritten on next complete run.",
-                        jsonl_path,
-                    )
+            with jsonl_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if isinstance(rec.get("idx"), int):
+                            already_done.add(rec["idx"])
+                            per_example.append(rec)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Skipping malformed JSONL line in %s; record will "
+                            "be overwritten on next complete run.",
+                            jsonl_path,
+                        )
             if already_done:
                 logger.info(
                     "Resuming: %d previously computed examples will be skipped.",
