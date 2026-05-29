@@ -243,7 +243,10 @@ def top_k_mces(
     # to avoid redundant O(N) RDKit parsing for the same molecule inside myopic_mces.MCES.
     try:
         from rdkit import Chem
-        gt_mol = Chem.MolFromSmiles(gt_smiles)
+        if len(gt_smiles) > MAX_SMILES_LENGTH:
+            gt_mol = None
+        else:
+            gt_mol = Chem.MolFromSmiles(gt_smiles)
         if gt_mol is None:
             # Fall back to str if parsing fails to avoid crashing unexpectedly
             gt_mol = gt_smiles
