@@ -25,3 +25,6 @@
 ## 2024-05-27 - Precompute RDKit Mol Objects for MCES Evaluation
 **Learning:** The `myopic_mces.MCES` function (and its wrapper `mces_distance`) natively accepts pre-parsed RDKit `Mol` objects in addition to SMILES strings. When computing MCES distance in a loop against top-k predictions (`top_k_mces`), passing the ground-truth SMILES string causes it to be redundantly parsed into a molecule for every single prediction, causing a measurable performance bottleneck.
 **Action:** When performing O(N) evaluation metric comparisons involving external packages like `myopic_mces`, always pre-parse the constant ground-truth target (e.g., into an RDKit `Mol` object) outside the loop and pass the parsed object into the comparison function if supported. Update the comparison function's type hints to accept the parsed object type to reflect this optimization.
+## 2025-02-21 - Memoization for SMILES processing
+**Learning:** In metric calculations, functions like `canonicalise` and `_morgan_fp` are frequently called with duplicate SMILES strings (e.g., identical predictions across top-k). Re-parsing identical strings with RDKit creates an unnecessary O(N) bottleneck.
+**Action:** Use Python's `@functools.lru_cache` to memoize functions that map string inputs to deterministic outputs, significantly speeding up evaluation when there are duplicate predictions.

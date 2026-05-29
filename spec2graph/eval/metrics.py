@@ -20,6 +20,7 @@ silent under-counting in naive implementations.
 from __future__ import annotations
 
 import contextlib
+import functools
 import io
 import logging
 from collections import Counter
@@ -42,6 +43,7 @@ MCES_SENTINEL_DISTANCE: float = 100.0
 # ----------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=1024)
 def canonicalise(smiles: Optional[str]) -> Optional[str]:
     """Return the RDKit-canonical form of ``smiles`` or ``None``.
 
@@ -95,6 +97,7 @@ def rank_samples_by_frequency(
 # ----------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=1024)
 def _morgan_fp(smiles: str, radius: int = 2, n_bits: int = 2048):
     if len(smiles) > MAX_SMILES_LENGTH:
         return None
