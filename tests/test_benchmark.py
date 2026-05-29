@@ -301,7 +301,8 @@ def test_end_to_end_benchmark_smoke(tmp_path: Path):
     assert results.n_samples_per_example == 2
 
     # JSONL must contain one line per test example.
-    lines = jsonl_path.read_text().strip().splitlines()
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        lines = [line for line in f if line.strip()]
     assert len(lines) == len(test_ds)
     for line in lines:
         parsed = json.loads(line)
