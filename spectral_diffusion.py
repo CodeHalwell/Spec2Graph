@@ -41,7 +41,7 @@ MAX_SMILES_LENGTH = 2000
 
 try:
     from rdkit import Chem, DataStructs
-    from rdkit.Chem import AllChem
+    from rdkit.Chem import AllChem, rdFingerprintGenerator
 
     _HAS_RDKIT = True
 except ImportError:  # pragma: no cover - handled at runtime with clear error
@@ -253,7 +253,10 @@ class SpectralDataProcessor:
             raise ValueError(f"Invalid SMILES: {smiles}")
         if mol.GetNumAtoms() == 0:
             raise ValueError(f"SMILES {smiles} resulted in 0 atoms.")
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+        # OPTIMIZATION: Use the modern, faster rdFingerprintGenerator API
+        # instead of the deprecated AllChem.GetMorganFingerprintAsBitVect
+        gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
+        fp = gen.GetFingerprint(mol)
         arr = np.zeros((n_bits,), dtype=np.float32)
         DataStructs.ConvertToNumpyArray(fp, arr)
         return arr
