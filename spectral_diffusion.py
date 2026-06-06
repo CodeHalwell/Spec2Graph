@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional, Union
 import warnings
 
 # Numerical floor to avoid divide-by-zero when reconstructing clean samples
@@ -68,9 +68,7 @@ class SpectralDataProcessor:
         self.k = k
         self.bond_weighting = bond_weighting
         # Cache generators by (radius, n_bits) to avoid repeated construction.
-        self._morgan_generators: Dict[
-            Tuple[int, int], "rdFingerprintGenerator.FingerprintGenerator64"
-        ] = {}
+        self._morgan_generators: Dict[Tuple[int, int], Any] = {}
 
     @staticmethod
     def _require_rdkit():
