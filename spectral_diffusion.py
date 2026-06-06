@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional, Union
 import warnings
 
 # Numerical floor to avoid divide-by-zero when reconstructing clean samples
@@ -41,13 +41,13 @@ MAX_SMILES_LENGTH = 2000
 
 try:
     from rdkit import Chem, DataStructs
-    from rdkit.Chem import AllChem
+    from rdkit.Chem import rdFingerprintGenerator
 
     _HAS_RDKIT = True
 except ImportError:  # pragma: no cover - handled at runtime with clear error
     Chem = None
     DataStructs = None
-    AllChem = None
+    rdFingerprintGenerator = None
     _HAS_RDKIT = False
 
 
@@ -67,6 +67,8 @@ class SpectralDataProcessor:
         """
         self.k = k
         self.bond_weighting = bond_weighting
+        # Cache generators by (radius, n_bits) to avoid repeated construction.
+        self._morgan_generators: Dict[Tuple[int, int], Any] = {}
 
     @staticmethod
     def _require_rdkit():
@@ -253,7 +255,14 @@ class SpectralDataProcessor:
             raise ValueError(f"Invalid SMILES: {smiles}")
         if mol.GetNumAtoms() == 0:
             raise ValueError(f"SMILES {smiles} resulted in 0 atoms.")
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+        # OPTIMIZATION: Use the modern, faster rdFingerprintGenerator API
+        # instead of the deprecated AllChem.GetMorganFingerprintAsBitVect
+        key = (radius, n_bits)
+        gen = self._morgan_generators.get(key)
+        if gen is None:
+            gen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=n_bits)
+            self._morgan_generators[key] = gen
+        fp = gen.GetFingerprint(mol)
         arr = np.zeros((n_bits,), dtype=np.float32)
         DataStructs.ConvertToNumpyArray(fp, arr)
         return arr
