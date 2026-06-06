@@ -67,7 +67,10 @@ class SpectralDataProcessor:
         """
         self.k = k
         self.bond_weighting = bond_weighting
-        self._morgan_generators: Dict[Tuple[int, int], object] = {}
+        # Cache generators by (radius, n_bits) to avoid repeated construction.
+        self._morgan_generators: Dict[
+            Tuple[int, int], "rdFingerprintGenerator.FingerprintGenerator64"
+        ] = {}
 
     @staticmethod
     def _require_rdkit():
