@@ -156,6 +156,11 @@ def mces_distance(
             "install via `pip install myopic-mces`."
         ) from exc
 
+    if isinstance(smiles_a, str) and len(smiles_a) > MAX_SMILES_LENGTH:
+        return MCES_SENTINEL_DISTANCE
+    if len(smiles_b) > MAX_SMILES_LENGTH:
+        return MCES_SENTINEL_DISTANCE
+
     # MCES returns (index, distance, time, exact_flag). The distance is
     # what we want; index/time/exact_flag are ignored.
     buffer = io.StringIO()

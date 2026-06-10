@@ -31,3 +31,8 @@
 **Vulnerability:** SMILES parsing via `Chem.MolFromSmiles(gt_smiles)` lacked a strict length limit check in the `top_k_mces` metric function within `spec2graph/eval/metrics.py`. This omission could allow malicious inputs to trigger excessive CPU/Memory consumption (DoS) when constructing the ground truth `Mol` object.
 **Learning:** Functions that parse molecular representations like SMILES into heavy downstream structures (like `Mol` objects in RDKit) must strictly enforce input length limits to defend against DoS, even inside evaluation or metric functions where inputs might be assumed safe.
 **Prevention:** Always enforce a strict hard length limit check (e.g., `len(smiles) > MAX_SMILES_LENGTH`) before calling parsing functions like `Chem.MolFromSmiles` anywhere in the codebase.
+
+## 2025-02-24 - Fix DoS via unbounded SMILES parsing in MCES metric
+**Vulnerability:** SMILES parsing in the `mces_distance` metric function within `spec2graph/eval/metrics.py` lacked a strict length limit check for both inputs `smiles_a` and `smiles_b`. This omission could allow malicious inputs to trigger excessive CPU/Memory consumption (DoS) when calculating maximum common edge subgraph distances via `myopic_mces.MCES`.
+**Learning:** External C++ libraries called for graph isomorphism or edge subgraphs can experience exponential scaling with unconstrained inputs. We must validate input length limits on strings before passing them to computationally expensive metric calculations.
+**Prevention:** Always enforce a strict hard length limit check (e.g., `len(smiles) > MAX_SMILES_LENGTH`) before evaluating similarity or distance metrics on molecular string representations.
