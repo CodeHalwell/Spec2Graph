@@ -256,6 +256,8 @@ def top_k_mces(
             gt_mol = None
         else:
             gt_mol = Chem.MolFromSmiles(gt_smiles)
+            if gt_mol is not None and gt_mol.GetNumAtoms() == 0:
+                gt_mol = None
         if gt_mol is None:
             # Fall back to str if parsing fails to avoid crashing unexpectedly
             gt_mol = gt_smiles
