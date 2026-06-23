@@ -1307,6 +1307,12 @@ class DiffusionTrainer:
         noise = torch.randn_like(x_0)
         x_t, _ = self.q_sample(x_0, t, noise)
 
+        # Precompute spectrum embeddings once to avoid redundant O(N) re-encoding
+        # during the forward pass and across all auxiliary prediction heads.
+        encoded_spectrum = self.model.encode_spectrum(
+            mz, intensity, spectrum_mask, precursor_mz
+        )
+
         # If the atom-type loss is active this step, do a single forward
         # pass that returns both noise prediction and atom-type logits so
         # we don't run the decoder twice.
@@ -1318,11 +1324,11 @@ class DiffusionTrainer:
         )
         if atom_type_active:
             predicted_noise, atom_type_logits = self.model.forward_with_atom_types(
-                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz, memory=encoded_spectrum
             )
         else:
             predicted_noise = self.model(
-                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz
+                x_t, t, mz, intensity, atom_mask, spectrum_mask, precursor_mz, memory=encoded_spectrum
             )
 
         # Compute loss (only on valid atoms if mask provided)
@@ -1366,15 +1372,7 @@ class DiffusionTrainer:
             loss = loss + self.orthonormality_loss_weight * ortho_loss
 
         # Encode spectrum once for all auxiliary heads
-        encoded_spectrum = None
-        if (
-            (self.fingerprint_loss_weight > 0 and fingerprint_targets is not None)
-            or (self.atom_count_loss_weight > 0 and atom_count_targets is not None)
-            or (self.eigenvalue_loss_weight > 0 and eigenvalue_targets is not None)
-        ):
-            encoded_spectrum = self.model.encode_spectrum(
-                mz, intensity, spectrum_mask, precursor_mz
-            )
+        # (Already precomputed above)
 
         if self.fingerprint_loss_weight > 0 and fingerprint_targets is not None:
             fp_logits = self.model.predict_fingerprint(
