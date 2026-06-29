@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import functools
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -38,6 +39,7 @@ except ImportError:  # pragma: no cover - torch is a hard dep of the repo
 logger = logging.getLogger(__name__)
 
 
+@functools.lru_cache(maxsize=4096)
 def _adjacency_from_smiles(smiles: str) -> Optional[np.ndarray]:
     """Return the heavy-atom adjacency matrix for a SMILES, or ``None``.
 
@@ -73,6 +75,7 @@ def _adjacency_from_smiles(smiles: str) -> Optional[np.ndarray]:
     return adjacency
 
 
+@functools.lru_cache(maxsize=4096)
 def _atom_symbols_from_smiles(smiles: str) -> Optional[list[str]]:
     """Return a list of element symbols in RDKit canonical order."""
     if len(smiles) > MAX_SMILES_LENGTH:
@@ -339,6 +342,9 @@ def _has_usable_peaks_post_cutoff(row: pd.Series) -> bool:
     return bool((mz < cutoff).any())
 
 
+# OPTIMIZATION: Memoize SMILES parsing to avoid redundant O(N) RDKit computations
+# for duplicated molecules in mass spec datasets.
+@functools.lru_cache(maxsize=4096)
 def _heavy_atom_count(smiles: str) -> int:
     """Return the number of heavy atoms or 0 if RDKit can't parse."""
     if len(smiles) > MAX_SMILES_LENGTH:
