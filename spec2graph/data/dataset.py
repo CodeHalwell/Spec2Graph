@@ -13,6 +13,7 @@ can be loaded cleanly.
 
 from __future__ import annotations
 
+import functools
 import logging
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -38,7 +39,11 @@ except ImportError:  # pragma: no cover - torch is a hard dep of the repo
 logger = logging.getLogger(__name__)
 
 
-def _adjacency_from_smiles(smiles: str) -> Optional[np.ndarray]:
+# OPTIMIZATION: Caching RDKit heavy-atom count and SMILES parsing
+# avoids redundant parsing of identical molecules in the dataset, significantly speeding up data loading.
+
+@functools.lru_cache(maxsize=4096)
+def _cached_adjacency_from_smiles(smiles: str) -> Optional[np.ndarray]:
     """Return the heavy-atom adjacency matrix for a SMILES, or ``None``.
 
     Bond orders are real-valued to match :class:`SpectralDataProcessor`
@@ -73,7 +78,13 @@ def _adjacency_from_smiles(smiles: str) -> Optional[np.ndarray]:
     return adjacency
 
 
-def _atom_symbols_from_smiles(smiles: str) -> Optional[list[str]]:
+def _adjacency_from_smiles(smiles: str) -> Optional[np.ndarray]:
+    res = _cached_adjacency_from_smiles(smiles)
+    return res.copy() if res is not None else None
+
+
+@functools.lru_cache(maxsize=4096)
+def _cached_atom_symbols_from_smiles(smiles: str) -> Optional[list[str]]:
     """Return a list of element symbols in RDKit canonical order."""
     if len(smiles) > MAX_SMILES_LENGTH:
         return None
@@ -89,6 +100,11 @@ def _atom_symbols_from_smiles(smiles: str) -> Optional[list[str]]:
     if mol.GetNumAtoms() == 0:
         return None
     return [atom.GetSymbol() for atom in mol.GetAtoms()]
+
+
+def _atom_symbols_from_smiles(smiles: str) -> Optional[list[str]]:
+    res = _cached_atom_symbols_from_smiles(smiles)
+    return list(res) if res is not None else None
 
 
 class MassSpecGymDataset(_TorchDataset):
@@ -339,6 +355,7 @@ def _has_usable_peaks_post_cutoff(row: pd.Series) -> bool:
     return bool((mz < cutoff).any())
 
 
+@functools.lru_cache(maxsize=4096)
 def _heavy_atom_count(smiles: str) -> int:
     """Return the number of heavy atoms or 0 if RDKit can't parse."""
     if len(smiles) > MAX_SMILES_LENGTH:
