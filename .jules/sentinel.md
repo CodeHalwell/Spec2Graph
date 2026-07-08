@@ -36,3 +36,8 @@
 **Vulnerability:** SMILES parsing in the `mces_distance` metric function within `spec2graph/eval/metrics.py` lacked a strict length limit check for both inputs `smiles_a` and `smiles_b`. This omission could allow malicious inputs to trigger excessive CPU/Memory consumption (DoS) when calculating maximum common edge subgraph distances via `myopic_mces.MCES`.
 **Learning:** External C++ libraries called for graph isomorphism or edge subgraphs can experience exponential scaling with unconstrained inputs. We must validate input length limits on strings before passing them to computationally expensive metric calculations.
 **Prevention:** Always enforce a strict hard length limit check (e.g., `len(smiles) > MAX_SMILES_LENGTH`) before evaluating similarity or distance metrics on molecular string representations.
+
+## 2025-02-25 - Fix DoS via unbounded SMILES caching
+**Vulnerability:** The cache generation methods `get_or_compute` and `get_or_compute_fingerprint` in `spec2graph/data/cache.py` did not validate SMILES length prior to invoking heavy RDKit computations (eigh/fingerprint generation).
+**Learning:** Even internal cache priming layers must enforce input bounds on strings if they invoke C++ libraries, as large/malicious SMILES can hang the pipeline or cause OOM.
+**Prevention:** Apply `MAX_SMILES_LENGTH` validation on SMILES before calling compute routines, returning early.

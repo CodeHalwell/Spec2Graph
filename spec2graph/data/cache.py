@@ -32,6 +32,8 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from spectral_diffusion import MAX_SMILES_LENGTH
+
 from spectral_diffusion import SpectralDataProcessor
 
 logger = logging.getLogger(__name__)
@@ -178,6 +180,14 @@ class EigenvectorCache:
         rejects the SMILES — callers should drop that row rather than
         failing the batch.
         """
+        if len(smiles) > MAX_SMILES_LENGTH:
+            logger.warning(
+                "SMILES string exceeds MAX_SMILES_LENGTH for %s (inchikey=%s)",
+                smiles[:50] + "..." if len(smiles) > 50 else smiles,
+                inchikey,
+            )
+            return None
+
         path = self.eigvec_path(inchikey)
 
         cached = self._load_npy(path)
@@ -207,6 +217,14 @@ class EigenvectorCache:
         self, smiles: str, inchikey: str
     ) -> Optional[np.ndarray]:
         """Return cached Morgan fingerprint, computing it if necessary."""
+        if len(smiles) > MAX_SMILES_LENGTH:
+            logger.warning(
+                "SMILES string exceeds MAX_SMILES_LENGTH for %s (inchikey=%s)",
+                smiles[:50] + "..." if len(smiles) > 50 else smiles,
+                inchikey,
+            )
+            return None
+
         path = self.fingerprint_path(inchikey)
 
         cached = self._load_npy(path)
