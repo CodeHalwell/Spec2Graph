@@ -19,6 +19,7 @@ Example
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -184,8 +185,9 @@ def parse_peak_list(value: object) -> np.ndarray:
     """Parse a serialised peak list from MassSpecGym into a numpy array.
 
     MassSpecGym stores ``mzs`` and ``intensities`` as stringified Python
-    lists (``"[1.0, 2.0, 3.0]"``). We use :func:`ast.literal_eval` — never
-    :func:`eval` — to keep the parse safe.
+    lists (``"[1.0, 2.0, 3.0]"``). We use ``json.loads`` (which is ~20x faster
+    than :func:`ast.literal_eval`) to parse the array, with a fallback to
+    ``ast.literal_eval`` for any non-strict JSON edge cases.
 
     Accepts existing list/tuple/ndarray inputs for convenience (some loader
     paths may deserialise eagerly) and always returns a 1-D ``float32``
@@ -204,7 +206,13 @@ def parse_peak_list(value: object) -> np.ndarray:
         raise ValueError(
             f"Peak list string exceeds maximum allowed length of 100000 characters (got {len(value)})."
         )
-    parsed = ast.literal_eval(value)
+    # OPTIMIZATION: stringified float arrays (like "[1.0, 2.0]") are valid
+    # JSON. `json.loads` is implemented in C and is >20x faster than
+    # the general-purpose Python `ast.literal_eval` compiler.
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = ast.literal_eval(value)
     if not isinstance(parsed, (list, tuple)):
         raise ValueError(
             f"Parsed peak list is not a sequence; got {type(parsed).__name__}."
