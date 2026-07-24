@@ -86,7 +86,7 @@ def adjacency_targets_from_batch(
         n = min(adj.shape[0], max_atoms)
         target[i, :n, :n] = (adj[:n, :n] > threshold).astype(np.float32)
     # Zero the diagonal to match the SGNO's self-loop handling.
-    target[:, np.arange(max_atoms), np.arange(max_atoms)] = 0.0
+    target.reshape(target.shape[0], -1)[:, ::max_atoms + 1] = 0.0
 
     tensor = torch.from_numpy(target)
     if device is not None:
