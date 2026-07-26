@@ -36,3 +36,7 @@
 ## 2025-02-23 - [Optimize Peak List Parsing]
 **Learning:** In mass spectrometry datasets like MassSpecGym, peak lists (e.g., `mzs` and `intensities`) are stored as large stringified float arrays (e.g., `"[1.0, 2.0, 3.0]"`). Parsing these strings using the standard Python `ast.literal_eval` is a massive performance bottleneck because `ast` is a general-purpose compiler tool that is not optimized for large homogeneous arrays. However, since these stringified lists are valid JSON, using the C-implemented `json.loads` module is over 20x faster.
 **Action:** When parsing large stringified arrays or lists from external data sources, check if the string format is valid JSON. If it is, use `json.loads` wrapped in a `try...except json.JSONDecodeError:` block with a fallback to `ast.literal_eval` to safely accelerate the parsing without sacrificing compatibility or security (as `json.loads` does not execute code).
+
+## 2024-05-28 - Avoid Advanced Indexing for Batch Diagonal Modifications in NumPy
+**Learning:** In NumPy, zeroing the diagonal of a batched square matrix using advanced indexing (`arr[:, np.arange(N), np.arange(N)] = 0`) creates new arrays and executes slower code paths due to dynamic memory allocations.
+**Action:** When modifying the diagonal of batched square matrices, use reshaping and basic slicing (`arr.reshape(arr.shape[0], -1)[:, ::N + 1] = 0`) to modify the underlying memory view directly, avoiding allocations and doubling performance.
