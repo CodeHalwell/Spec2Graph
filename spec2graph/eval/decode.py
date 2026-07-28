@@ -72,9 +72,9 @@ def parse_formula(formula: str) -> dict[str, int]:
     """
     if not formula:
         raise ValueError("formula is empty.")
-    if len(formula) > 100000:
+    if len(formula) > 1000:
         raise ValueError(
-            f"Formula string exceeds maximum allowed length of 100000 characters (got {len(formula)})."
+            f"Formula string exceeds maximum allowed length of 1000 characters (got {len(formula)})."
         )
     counts: dict[str, int] = {}
     total_atoms = 0
@@ -85,9 +85,9 @@ def parse_formula(formula: str) -> dict[str, int]:
             continue
         count = int(count_str) if count_str else 1
         total_atoms += count
-        if total_atoms > 100000:
+        if total_atoms > 1000:
             raise ValueError(
-                "Parsed formula describes a molecule with more than 100000 atoms, "
+                "Parsed formula describes a molecule with more than 1000 atoms, "
                 "which is not supported."
             )
         counts[symbol] = counts.get(symbol, 0) + count
