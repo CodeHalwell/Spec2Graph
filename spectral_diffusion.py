@@ -1906,16 +1906,23 @@ class ValencyDecoder:
 
         adjacency = np.zeros((n_atoms, n_atoms), dtype=np.float32)
 
-        # Collect candidate bonds with their probabilities
-        candidates = []
-        for i in range(n_atoms):
-            for j in range(i + 1, n_atoms):
-                prob = float(bond_probs[i, j])
-                if prob >= threshold:
-                    candidates.append((prob, i, j))
+        # OPTIMIZATION: Replace O(N^2) Python nested loops with vectorized numpy operations
+        # to collect and sort candidate bonds, significantly speeding up valency-aware decoding.
+        i_idx, j_idx = np.triu_indices(n_atoms, k=1)
+        probs = bond_probs[i_idx, j_idx]
+        mask = probs >= threshold
+
+        valid_probs = probs[mask]
+        valid_i = i_idx[mask]
+        valid_j = j_idx[mask]
 
         # Sort by probability (descending)
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        sort_idx = np.argsort(-valid_probs, kind='stable')
+        candidates = list(zip(
+            valid_probs[sort_idx].tolist(),
+            valid_i[sort_idx].tolist(),
+            valid_j[sort_idx].tolist()
+        ))
 
         # Greedy assignment respecting valency
         for prob, i, j in candidates:
