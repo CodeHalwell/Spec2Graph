@@ -36,3 +36,7 @@
 ## 2025-02-23 - [Optimize Peak List Parsing]
 **Learning:** In mass spectrometry datasets like MassSpecGym, peak lists (e.g., `mzs` and `intensities`) are stored as large stringified float arrays (e.g., `"[1.0, 2.0, 3.0]"`). Parsing these strings using the standard Python `ast.literal_eval` is a massive performance bottleneck because `ast` is a general-purpose compiler tool that is not optimized for large homogeneous arrays. However, since these stringified lists are valid JSON, using the C-implemented `json.loads` module is over 20x faster.
 **Action:** When parsing large stringified arrays or lists from external data sources, check if the string format is valid JSON. If it is, use `json.loads` wrapped in a `try...except json.JSONDecodeError:` block with a fallback to `ast.literal_eval` to safely accelerate the parsing without sacrificing compatibility or security (as `json.loads` does not execute code).
+
+## 2025-02-23 - [Vectorize O(N^2) Candidate Collection]
+**Learning:** When collecting candidate node pairs in an O(N^2) Python loop, it causes a significant bottleneck. Using NumPy's `np.triu_indices` with boolean masking is much faster.
+**Action:** Replace nested loops iterating over upper triangular matrix elements with vectorized NumPy operations and convert the output to native Python types using `.tolist()` to maintain compatibility with downstream type-strict operations.
