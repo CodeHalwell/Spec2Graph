@@ -47,11 +47,11 @@ class TestParseFormula:
 
     def test_excessive_length_raises(self):
         with pytest.raises(ValueError, match="exceeds maximum allowed length"):
-            parse_formula("C" * 100001)
+            parse_formula("C" * 1001)
 
     def test_excessive_atoms_raises(self):
-        with pytest.raises(ValueError, match="more than 100000 atoms"):
-            parse_formula("C100001")
+        with pytest.raises(ValueError, match="more than 1000 atoms"):
+            parse_formula("C1001")
 
 
 class TestFormulaToAtomTypes:
