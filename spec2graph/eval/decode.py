@@ -256,16 +256,23 @@ def adjacency_to_rwmol(
     for symbol in atom_types:
         mol.AddAtom(Chem.Atom(symbol))
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            order = int(round(float(adjacency[i, j])))
-            if order == 0:
-                continue
-            if order not in bond_type_map:
-                raise ValueError(
-                    f"Unsupported bond order {order} at ({i}, {j}); expected 0-3."
-                )
-            mol.AddBond(i, j, bond_type_map[order])
+    # Vectorize candidate collection to avoid O(N^2) Python loop overhead
+    # Ensure adjacency is a NumPy array to avoid issues with PyTorch tensors
+    adjacency = np.asarray(adjacency)
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    orders = np.round(adjacency[i_idx, j_idx]).astype(int)
+    mask = orders != 0
+
+    valid_orders = orders[mask].tolist()
+    valid_i = i_idx[mask].tolist()
+    valid_j = j_idx[mask].tolist()
+
+    for order, i, j in zip(valid_orders, valid_i, valid_j):
+        if order not in bond_type_map:
+            raise ValueError(
+                f"Unsupported bond order {order} at ({i}, {j}); expected 0-3."
+            )
+        mol.AddBond(i, j, bond_type_map[order])
     return mol
 
 
