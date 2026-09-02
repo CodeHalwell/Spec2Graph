@@ -256,16 +256,18 @@ def adjacency_to_rwmol(
     for symbol in atom_types:
         mol.AddAtom(Chem.Atom(symbol))
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            order = int(round(float(adjacency[i, j])))
-            if order == 0:
-                continue
-            if order not in bond_type_map:
-                raise ValueError(
-                    f"Unsupported bond order {order} at ({i}, {j}); expected 0-3."
-                )
-            mol.AddBond(i, j, bond_type_map[order])
+    # OPTIMIZATION: Use vectorized NumPy operations instead of a nested loop
+    # to find non-zero edges. This significantly speeds up decoding.
+    rows, cols = np.triu_indices(n, k=1)
+    orders = np.round(np.asarray(adjacency)[rows, cols]).astype(int)
+    mask = orders != 0
+
+    for i, j, order in zip(rows[mask].tolist(), cols[mask].tolist(), orders[mask].tolist()):
+        if order not in bond_type_map:
+            raise ValueError(
+                f"Unsupported bond order {order} at ({i}, {j}); expected 0-3."
+            )
+        mol.AddBond(i, j, bond_type_map[order])
     return mol
 
 
