@@ -165,7 +165,7 @@ def mces_distance(
     # what we want; index/time/exact_flag are ignored.
     buffer = io.StringIO()
     try:
-        with contextlib.redirect_stdout(buffer):
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
             result = MCES(smiles_a, smiles_b, threshold=threshold, catch_errors=True)
     except Exception as exc:  # myopic_mces can raise on ILP issues
         logger.debug("MCES raised: %s", exc)
