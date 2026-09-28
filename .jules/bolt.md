@@ -5,6 +5,7 @@
 ## 2024-05-25 - Avoid dynamic tensor allocation in forward pass
 **Learning:** In PyTorch, allocating tensors dynamically during the forward pass (e.g., using `torch.arange(N, device=device)`) inside a loop (such as a diffusion model's sampling loop) causes device synchronization and memory allocation overhead.
 **Action:** When a tensor's values only depend on a known maximum length, pre-allocate it in the module's `__init__` as a non-persistent buffer (`self.register_buffer('name', tensor, persistent=False)`). During the forward pass, simply slice the buffer dynamically to the required length (e.g., `self.name[:N]`). The `persistent=False` flag guarantees backward compatibility with existing checkpoints.
+
 ## 2024-05-26 - Precompute ground truth properties in evaluation metrics
 **Learning:** In evaluation metric loops (e.g., `top_k_tanimoto` or similar), repeatedly parsing the ground truth SMILES and generating its Morgan fingerprint inside the loop for every top-k prediction is an O(N) performance bottleneck.
 **Action:** Always precompute properties, like fingerprints or `RDKit` molecule objects, for the ground truth molecule outside the prediction loop to eliminate redundant parsing and generation overhead.
@@ -12,12 +13,15 @@
 ## 2024-05-26 - Avoid negligible micro-optimizations on small tensors
 **Learning:** Replacing a one-off `torch.arange(N, device=device)` call with a slice of a pre-allocated tensor buffer `positions[:N]` when `N` is small and the call happens only once per forward pass (not deep in a heavy loop) is a negligible micro-optimization. Furthermore, blindly slicing pre-allocated positional buffers is unsafe due to potential shape and semantic mismatches.
 **Action:** Do not implement micro-optimizations that offer no measurable impact or require unsafe assumptions about model properties. Focus on $O(N)$ vs $O(N^2)$ structural bottlenecks or redundant computations.
+
 ## 2025-02-20 - [GNN Adjacency Normalization Optimization]
 **Learning:** In PyTorch GNNs, when aggregating features using a dense normalized adjacency matrix (e.g., `D^{-1/2} A D^{-1/2} X`), computing `adj_norm = adj * D_inv_sqrt * D_inv_sqrt.transpose()` forces an O(N^2) memory allocation and broadcasting overhead.
 **Action:** Use the associative property of matrix multiplication to rewrite it as `D^{-1/2} (A (D^{-1/2} X))`. First scale features (`x_scaled = x * D_inv_sqrt`), perform message passing `torch.bmm(adj, x_scaled)`, and finally scale the output `agg = agg * D_inv_sqrt`. This avoids the O(N^2) dense matrix and saves significant time and memory.
+
 ## 2025-02-21 - [Diffusion Loop Redundant Computation]
 **Learning:** In diffusion models, passing static context (like `mz` and `intensity` spectrum features) repeatedly to the denoiser during the reverse sampling loop causes redundant encoding (O(N) operations per timestep) if the encoder is invoked inside `forward`. For 1000 timesteps, this wastes significant computation.
 **Action:** When context features are static across diffusion timesteps, precompute their embeddings outside the reverse diffusion loop (e.g., `memory = encode(...)`) and pass the precomputed `memory` to the denoiser in the loop. Update the denoiser's `forward` to accept and use this optional `memory`.
+
 ## 2024-05-27 - Caching Shared Sub-Network Computations in Multi-Task Architectures
 **Learning:** In multi-task models with multiple independent prediction heads attached to a shared encoder (like `predict_fingerprint`, `predict_atom_count`, `predict_eigenvalues`), redundantly evaluating the encoder from within each head`s prediction method causes severe O(N^2) or O(N^3) performance regressions during the training loop when calculating individual losses.
 **Action:** When designing auxiliary heads, accept an optional `encoded` tensor as a parameter. In the training loop where multiple heads are evaluated against the same input, execute the shared encoder once, cache the `encoded` output, and distribute it to the auxiliary heads. This minimizes computational waste and guarantees deterministic consistency across heads if stochastic operations (like dropout) are used in the shared encoder.
@@ -33,6 +37,7 @@
 ## 2025-02-22 - [Training Loop Redundant Computation Fix]
 **Learning:** In the training loop `compute_loss`, multiple model calls (such as the main denoiser and auxiliary heads like `predict_fingerprint`, `predict_atom_count`) require encoded spectrum features. Previously, the spectrum was encoded independently inside the main denoiser (via `self.model(...)` or `forward_with_atom_types`) and then later encoded again for the auxiliary heads, causing redundant O(N) re-encoding computations during training.
 **Action:** When context features (like the encoded spectrum) are needed by both the main forward pass and auxiliary heads during training, precompute the embeddings once at the beginning of `compute_loss` and pass them as the `memory` parameter to `self.model(...)` and `self.model.forward_with_atom_types(...)` to share the computation across all heads and reduce training overhead.
+
 ## 2025-02-23 - [Optimize Peak List Parsing]
 **Learning:** In mass spectrometry datasets like MassSpecGym, peak lists (e.g., `mzs` and `intensities`) are stored as large stringified float arrays (e.g., `"[1.0, 2.0, 3.0]"`). Parsing these strings using the standard Python `ast.literal_eval` is a massive performance bottleneck because `ast` is a general-purpose compiler tool that is not optimized for large homogeneous arrays. However, since these stringified lists are valid JSON, using the C-implemented `json.loads` module is over 20x faster.
 **Action:** When parsing large stringified arrays or lists from external data sources, check if the string format is valid JSON. If it is, use `json.loads` wrapped in a `try...except json.JSONDecodeError:` block with a fallback to `ast.literal_eval` to safely accelerate the parsing without sacrificing compatibility or security (as `json.loads` does not execute code).
@@ -40,3 +45,7 @@
 ## 2025-02-23 - [Vectorize O(N^2) Candidate Collection]
 **Learning:** When collecting candidate node pairs in an O(N^2) Python loop, it causes a significant bottleneck. Using NumPy's `np.triu_indices` with boolean masking is much faster.
 **Action:** Replace nested loops iterating over upper triangular matrix elements with vectorized NumPy operations and convert the output to native Python types using `.tolist()` to maintain compatibility with downstream type-strict operations.
+
+## 2025-02-23 - [Pandas Dataframe Loop Optimization]
+**Learning:** Iterating over large pandas Dataframes with `iterrows` is incredibly slow, acting as a major bottleneck on large datasets. `itertuples` is significantly faster.
+**Action:** Always prefer `itertuples` when looping over Pandas Dataframes, and convert the tuple via `_asdict()` where dicts are strictly expected downstream.
