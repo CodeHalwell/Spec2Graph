@@ -232,7 +232,7 @@ class MassSpecGymDataset(_TorchDataset):
         #   Slower but guarantees every row survives ``__getitem__``.
         indexable_rows: list[int] = []
         missing: list[str] = []
-        for idx, row in filtered.iterrows():
+        for idx, row in zip(filtered.index, filtered.to_dict("records")):
             inchikey = row["inchikey"]
             if validate_cache:
                 if self.cache.get_or_compute(row["smiles"], inchikey) is None:
