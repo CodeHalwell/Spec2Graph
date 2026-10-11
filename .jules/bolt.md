@@ -40,3 +40,7 @@
 ## 2025-02-23 - [Vectorize O(N^2) Candidate Collection]
 **Learning:** When collecting candidate node pairs in an O(N^2) Python loop, it causes a significant bottleneck. Using NumPy's `np.triu_indices` with boolean masking is much faster.
 **Action:** Replace nested loops iterating over upper triangular matrix elements with vectorized NumPy operations and convert the output to native Python types using `.tolist()` to maintain compatibility with downstream type-strict operations.
+
+## 2024-05-28 - Avoid pd.DataFrame.iterrows()
+**Learning:** Iterating over a pandas DataFrame using `iterrows()` constructs a new `pd.Series` object for every row, which introduces significant overhead. In the case of dataset initialization loops, this becomes a major performance bottleneck.
+**Action:** Replace `iterrows()` with `itertuples()` for a dramatic speedup. When downstream functions require a dict-like interface (such as for type checking or compatibility), pass `row._asdict()` instead of the raw namedtuple, and ensure type hints correctly accept `dict[str, Any]` in addition to `pd.Series`.
