@@ -16,7 +16,7 @@ from __future__ import annotations
 import functools
 import logging
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Dict
 
 import numpy as np
 import pandas as pd
@@ -199,6 +199,7 @@ class MassSpecGymDataset(_TorchDataset):
                 max_atoms,
             )
         filtered = filtered.reset_index(drop=True)
+        filtered_records = filtered.to_dict("records")
 
         self.cache = EigenvectorCache(
             cache_dir=self.cache_dir,
@@ -232,7 +233,7 @@ class MassSpecGymDataset(_TorchDataset):
         #   Slower but guarantees every row survives ``__getitem__``.
         indexable_rows: list[int] = []
         missing: list[str] = []
-        for idx, row in filtered.iterrows():
+        for idx, row in enumerate(filtered_records):
             inchikey = row["inchikey"]
             if validate_cache:
                 if self.cache.get_or_compute(row["smiles"], inchikey) is None:
@@ -336,7 +337,7 @@ class MassSpecGymDataset(_TorchDataset):
         return sample
 
 
-def _has_usable_peaks_post_cutoff(row: pd.Series) -> bool:
+def _has_usable_peaks_post_cutoff(row: pd.Series | Dict[str, Any]) -> bool:
     """Return True iff the row still has peaks after the precursor-echo filter.
 
     Mirrors the ``m/z < precursor_mz - 0.5`` rule applied in
