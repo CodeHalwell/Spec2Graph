@@ -232,13 +232,14 @@ class MassSpecGymDataset(_TorchDataset):
         #   Slower but guarantees every row survives ``__getitem__``.
         indexable_rows: list[int] = []
         missing: list[str] = []
-        for idx, row in filtered.iterrows():
-            inchikey = row["inchikey"]
+        for row in filtered.itertuples():
+            idx = row[0]
+            inchikey = row.inchikey
             if validate_cache:
-                if self.cache.get_or_compute(row["smiles"], inchikey) is None:
+                if self.cache.get_or_compute(row.smiles, inchikey) is None:
                     missing.append(inchikey)
                     continue
-                if self.cache.get_or_compute_fingerprint(row["smiles"], inchikey) is None:
+                if self.cache.get_or_compute_fingerprint(row.smiles, inchikey) is None:
                     missing.append(inchikey)
                     continue
             else:
@@ -252,7 +253,7 @@ class MassSpecGymDataset(_TorchDataset):
             # that lose all their peaks to the precursor-echo cutoff
             # are dropped up-front rather than raising mid-epoch. This
             # is cheap: one pass over the stringified peak list.
-            if not _has_usable_peaks_post_cutoff(row):
+            if not _has_usable_peaks_post_cutoff(row._asdict()):
                 missing.append(inchikey)
                 continue
             indexable_rows.append(int(idx))
@@ -336,7 +337,7 @@ class MassSpecGymDataset(_TorchDataset):
         return sample
 
 
-def _has_usable_peaks_post_cutoff(row: pd.Series) -> bool:
+def _has_usable_peaks_post_cutoff(row: pd.Series | dict[str, Any]) -> bool:
     """Return True iff the row still has peaks after the precursor-echo filter.
 
     Mirrors the ``m/z < precursor_mz - 0.5`` rule applied in
@@ -346,7 +347,7 @@ def _has_usable_peaks_post_cutoff(row: pd.Series) -> bool:
     try:
         mz = parse_peak_list(row["mzs"])
         precursor_mz = float(row["precursor_mz"])
-    except (ValueError, SyntaxError, TypeError):
+    except (ValueError, SyntaxError, TypeError, KeyError):
         return False
     cutoff = precursor_mz - 0.5
     return bool((mz < cutoff).any())
