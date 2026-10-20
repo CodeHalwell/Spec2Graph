@@ -1,18 +1,8 @@
-"""Train the conditioned Spec2Graph model (and optionally the bond-type SGNO).
+"""Train the conditioned Spec2Graph model (and optionally the bond-type SGNO) on a molecule-disjoint split.
 
-Usage::
-
-    python -m spec2graph.scripts.casmi_train \\
-        --train-parquet data/train.parquet \\
-        --assets-dir assets/casmi \\
-        --cache-dir ~/.cache/spec2graph-casmi \\
-        --output-dir runs/casmi \\
-        --epochs 10 --batch-size 128 --lr 1e-4 --train-bond-sgno
-
-The split is molecule-disjoint by InChIKey14; the held-out keys are written
-to ``holdout_keys.json`` so validation and ranker fitting never see training
-structures. One checkpoint per epoch (``epoch_NNN.pt``) plus
-``bond_sgno_epoch_NNN.pt`` when the bond-type decoder is trained.
+python -m spec2graph.scripts.casmi_train --train-parquet data/train.parquet --assets-dir assets/casmi \\
+    --cache-dir ~/.cache/spec2graph-casmi --output-dir runs/casmi --epochs 10 --train-bond-sgno
+Use --heads-only for a quick proxy run (encoder + fingerprint/atom-count/quantile heads, no denoiser).
 """
 
 from __future__ import annotations
@@ -22,185 +12,95 @@ import json
 import logging
 from pathlib import Path
 
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+from spec2graph.casmi import data, validation
 from spec2graph.casmi.adducts import AdductVocabulary
 from spec2graph.casmi.conditioning import CasmiModel, CasmiModelConfig, CasmiTrainer, CasmiTrainerConfig, save_checkpoint
-from spec2graph.casmi.data import CasmiSpectrumDataset, PeakPreprocessConfig, load_casmi_parquet, make_casmi_collator
 from spec2graph.casmi.denovo import BondTypeSGNO, BondTypeTrainer, save_bond_sgno
 from spec2graph.casmi.spectral import SpectralCache
-from spec2graph.casmi.validation import add_inchikey14_column, molecule_disjoint_split, split_frame
 from spectral_diffusion import Spec2GraphDiffusion, Spec2GraphDiffusionConfig
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Spec2Graph for CASMI 2026.")
-    parser.add_argument("--train-parquet", required=True, type=Path)
-    parser.add_argument("--assets-dir", required=True, type=Path, help="Output of casmi_prepare (adducts.json, structures.parquet).")
-    parser.add_argument("--cache-dir", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--holdout-fraction", type=float, default=0.05)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num-encoder-layers", type=int, default=4)
-    parser.add_argument("--num-decoder-layers", type=int, default=4)
-    parser.add_argument("--dim-feedforward", type=int, default=1024)
-    parser.add_argument("--k", type=int, default=8)
-    parser.add_argument("--max-atoms", type=int, default=96)
-    parser.add_argument("--max-peaks", type=int, default=128)
-    parser.add_argument("--fingerprint-bits", type=int, default=2048)
-    parser.add_argument("--n-quantiles", type=int, default=32)
-    parser.add_argument("--n-timesteps", type=int, default=1000)
-    parser.add_argument("--projection-weight", type=float, default=1.0)
-    parser.add_argument("--orthonormality-weight", type=float, default=0.0)
-    parser.add_argument("--fingerprint-weight", type=float, default=0.5)
-    parser.add_argument("--atom-count-weight", type=float, default=0.05)
-    parser.add_argument("--atom-type-weight", type=float, default=0.5)
-    parser.add_argument("--quantile-weight", type=float, default=1.0)
-    parser.add_argument("--train-bond-sgno", action="store_true")
-    parser.add_argument("--bond-hidden-dim", type=int, default=128)
-    parser.add_argument("--bond-layers", type=int, default=3)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--max-train-rows", type=int, default=None, help="Development knob.")
-    parser.add_argument("--sqrt-intensity", action="store_true")
-    return parser.parse_args(argv)
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    for name in ("--train-parquet", "--assets-dir", "--cache-dir", "--output-dir"):
+        p.add_argument(name, required=True, type=Path)
+    ints = dict(epochs=10, batch_size=64, d_model=256, nhead=8, num_encoder_layers=4, num_decoder_layers=4, dim_feedforward=1024,
+                k=8, max_atoms=96, max_peaks=128, fingerprint_bits=2048, n_quantiles=32, n_timesteps=1000, bond_hidden_dim=128,
+                bond_layers=3, num_workers=0, seed=0)
+    floats = dict(holdout_fraction=0.05, lr=1e-4, projection_weight=1.0, orthonormality_weight=0.0, fingerprint_weight=0.5,
+                  atom_count_weight=0.05, atom_type_weight=0.5, quantile_weight=1.0, grad_clip=1.0)
+    for name, default in {**ints, **floats}.items():
+        p.add_argument(f"--{name.replace('_', '-')}", type=type(default), default=default)
+    p.add_argument("--max-train-rows", type=int, default=None, help="development knob")
+    for flag in ("--train-bond-sgno", "--sqrt-intensity", "--heads-only"):
+        p.add_argument(flag, action="store_true")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return p.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring only
-    args = _parse_args(argv)
+def build(a: argparse.Namespace, vocab: AdductVocabulary) -> tuple[CasmiTrainer, CasmiTrainerConfig]:
+    core = Spec2GraphDiffusion(Spec2GraphDiffusionConfig(
+        d_model=a.d_model, nhead=a.nhead, num_encoder_layers=a.num_encoder_layers, num_decoder_layers=a.num_decoder_layers,
+        dim_feedforward=a.dim_feedforward, k=a.k, max_atoms=a.max_atoms, max_peaks=a.max_peaks, fingerprint_dim=a.fingerprint_bits,
+        enable_atom_count_head=True, enable_atom_type_head=True))
+    config = CasmiTrainerConfig(
+        n_timesteps=a.n_timesteps, projection_loss_weight=a.projection_weight, orthonormality_loss_weight=a.orthonormality_weight,
+        fingerprint_loss_weight=a.fingerprint_weight, atom_count_loss_weight=a.atom_count_weight, atom_type_loss_weight=a.atom_type_weight,
+        quantile_loss_weight=a.quantile_weight, heads_only=a.heads_only)
+    return CasmiTrainer(CasmiModel(core, CasmiModelConfig(n_adducts=len(vocab), n_quantiles=a.n_quantiles)), config, a.device), config
+
+
+def train_epoch(loader, trainer: CasmiTrainer, optimiser, bond, bond_optimiser, a: argparse.Namespace) -> str:
+    """One pass over the loader; returns the mean loss components as a log string."""
+    totals, bond_losses, n = {}, [], 0
+    for batch in loader:
+        batch = batch.to(a.device)
+        loss, parts = trainer.train_step(optimiser, batch, return_components=True, grad_clip=a.grad_clip)
+        for key, value in {**parts, "total": loss}.items():
+            totals[key] = totals.get(key, 0.0) + value
+        n += 1
+        if bond and batch.adjacencies is not None:
+            tb = batch.core
+            bond_losses.append(bond.step(bond_optimiser, tb.x_0, tb.atom_mask, tb.atom_type_targets.clamp(min=0), batch.adjacencies))
+    summary = ", ".join(f"{k}={v / max(n, 1):.4f}" for k, v in totals.items())
+    return summary + (f", bond={sum(bond_losses) / len(bond_losses):.4f}" if bond_losses else "")
+
+
+def main(argv=None) -> int:  # pragma: no cover - wiring only
+    a = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    torch.manual_seed(args.seed)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(a.seed)
+    a.output_dir.mkdir(parents=True, exist_ok=True)
 
-    vocab = AdductVocabulary.load(args.assets_dir / "adducts.json")
-    structures = None
-    structures_path = args.assets_dir / "structures.parquet"
-    if structures_path.exists():
-        import pandas as pd
+    vocab = AdductVocabulary.load(a.assets_dir / "adducts.json")
+    table = pd.read_parquet(a.assets_dir / "structures.parquet") if (a.assets_dir / "structures.parquet").exists() else None
+    train = validation.with_keys(data.load(a.train_parquet, require_smiles=True).iloc[: a.max_train_rows])
+    _, holdout_keys = validation.split_keys(train["inchikey14"], a.holdout_fraction, a.seed)
+    train_df, holdout_df = validation.split_frame(train, holdout_keys)
+    (a.output_dir / "holdout_keys.json").write_text(json.dumps(sorted(holdout_keys)))
+    log.info("train spectra %d, holdout spectra %d (%d structures)", len(train_df), len(holdout_df), len(holdout_keys))
 
-        structures = pd.read_parquet(structures_path)
+    cache = SpectralCache(a.cache_dir, k=a.k, fingerprint_bits=a.fingerprint_bits)
+    dataset = data.Dataset(train_df, cache, vocab, max_atoms=a.max_atoms, n_quantiles=a.n_quantiles, table=table,
+                           peaks=data.Peaks(top_k=a.max_peaks, sqrt_intensity=a.sqrt_intensity), adjacency=a.train_bond_sgno, n_jobs=max(1, a.num_workers))
+    loader = DataLoader(dataset, batch_size=a.batch_size, shuffle=True, num_workers=a.num_workers,
+                        collate_fn=data.Collator(a.max_atoms, a.max_peaks, a.k, a.fingerprint_bits))
+    trainer, config = build(a, vocab)
+    optimiser = torch.optim.AdamW(trainer.wrapper.parameters(), lr=a.lr)
+    bond = BondTypeTrainer(BondTypeSGNO(a.k, a.bond_hidden_dim, a.bond_layers).to(a.device)) if a.train_bond_sgno else None
+    bond_optimiser = torch.optim.Adam(bond.sgno.parameters(), lr=1e-3) if bond else None
 
-    train = load_casmi_parquet(args.train_parquet, require_smiles=True)
-    if args.max_train_rows:
-        train = train.iloc[: args.max_train_rows]
-    train = add_inchikey14_column(train)
-    train_keys, holdout_keys = molecule_disjoint_split(train["inchikey14"], holdout_fraction=args.holdout_fraction, seed=args.seed)
-    train_df, holdout_df = split_frame(train, holdout_keys)
-    (args.output_dir / "holdout_keys.json").write_text(json.dumps(sorted(holdout_keys)))
-    logger.info("Train spectra: %d (%d structures); holdout spectra: %d (%d structures)", len(train_df), len(train_keys), len(holdout_df), len(holdout_keys))
-
-    peak_config = PeakPreprocessConfig(top_k_peaks=args.max_peaks, max_peaks=args.max_peaks, sqrt_intensity=args.sqrt_intensity)
-    cache = SpectralCache(args.cache_dir, k=args.k, fingerprint_bits=args.fingerprint_bits)
-    dataset = CasmiSpectrumDataset(
-        train_df,
-        cache=cache,
-        adduct_vocab=vocab,
-        k=args.k,
-        max_atoms=args.max_atoms,
-        fingerprint_bits=args.fingerprint_bits,
-        n_quantiles=args.n_quantiles,
-        peak_config=peak_config,
-        structures=structures,
-        include_adjacency=args.train_bond_sgno,
-        precompute=True,
-        n_jobs=max(1, args.num_workers),
-    )
-    logger.info("Dataset: %s", dataset.stats)
-
-    core = Spec2GraphDiffusion(
-        Spec2GraphDiffusionConfig(
-            d_model=args.d_model,
-            nhead=args.nhead,
-            num_encoder_layers=args.num_encoder_layers,
-            num_decoder_layers=args.num_decoder_layers,
-            dim_feedforward=args.dim_feedforward,
-            k=args.k,
-            max_atoms=args.max_atoms,
-            max_peaks=args.max_peaks,
-            fingerprint_dim=args.fingerprint_bits,
-            enable_atom_count_head=True,
-            enable_atom_type_head=True,
-        )
-    )
-    model = CasmiModel(core, CasmiModelConfig(n_adducts=len(vocab), n_quantiles=args.n_quantiles)).to(args.device)
-    trainer_config = CasmiTrainerConfig(
-        n_timesteps=args.n_timesteps,
-        projection_loss_weight=args.projection_weight,
-        orthonormality_loss_weight=args.orthonormality_weight,
-        fingerprint_loss_weight=args.fingerprint_weight,
-        atom_count_loss_weight=args.atom_count_weight,
-        atom_type_loss_weight=args.atom_type_weight,
-        quantile_loss_weight=args.quantile_weight,
-    )
-    trainer = CasmiTrainer(model, trainer_config, device=args.device)
-    optimiser = torch.optim.AdamW(model.parameters(), lr=args.lr)
-
-    bond_sgno = bond_trainer = bond_optimiser = None
-    if args.train_bond_sgno:
-        bond_sgno = BondTypeSGNO(k=args.k, hidden_dim=args.bond_hidden_dim, num_layers=args.bond_layers).to(args.device)
-        bond_trainer = BondTypeTrainer(bond_sgno, device=args.device)
-        bond_optimiser = torch.optim.Adam(bond_sgno.parameters(), lr=1e-3)
-
-    collate = make_casmi_collator(
-        max_atoms=args.max_atoms, max_peaks=args.max_peaks, k=args.k, fingerprint_bits=args.fingerprint_bits,
-        n_quantiles=args.n_quantiles, device="cpu",
-    )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate, num_workers=args.num_workers)
-
-    def _to_device(batch):
-        from dataclasses import replace
-
-        tb = batch.batch
-        moved_tb = type(tb)(**{
-            k: (v.to(args.device) if isinstance(v, torch.Tensor) else v) for k, v in tb.__dict__.items()
-        })
-        return replace(
-            batch,
-            batch=moved_tb,
-            adduct_index=batch.adduct_index.to(args.device),
-            collision_energy=batch.collision_energy.to(args.device),
-            collision_energy_mask=batch.collision_energy_mask.to(args.device),
-            neutral_mass=batch.neutral_mass.to(args.device),
-            polarity=batch.polarity.to(args.device),
-            spectral_quantiles=batch.spectral_quantiles.to(args.device),
-        )
-
-    for epoch in range(1, args.epochs + 1):
-        totals: dict[str, float] = {}
-        n_batches = 0
-        bond_losses: list[float] = []
-        for batch in loader:
-            batch = _to_device(batch)
-            loss, components = trainer.train_step(optimiser, batch, return_components=True, grad_clip=args.grad_clip)
-            for key, value in components.items():
-                totals[key] = totals.get(key, 0.0) + value
-            totals["total"] = totals.get("total", 0.0) + loss
-            n_batches += 1
-            if bond_trainer is not None and batch.adjacencies is not None:
-                bond_losses.append(
-                    bond_trainer.train_step(
-                        bond_optimiser, batch.batch.x_0, batch.batch.atom_mask, batch.batch.atom_type_targets.clamp(min=0), batch.adjacencies
-                    )
-                )
-        summary = ", ".join(f"{k}={v / max(n_batches, 1):.4f}" for k, v in totals.items())
-        logger.info("Epoch %d: %s", epoch, summary)
-        if bond_losses:
-            logger.info("Epoch %d: bond-type loss = %.4f", epoch, sum(bond_losses) / len(bond_losses))
-        save_checkpoint(
-            args.output_dir / f"epoch_{epoch:03d}.pt", model, trainer_config, vocab, epoch=epoch, optimizer=optimiser,
-            extra={"max_peaks": args.max_peaks, "sqrt_intensity": args.sqrt_intensity},
-        )
-        if bond_sgno is not None:
-            save_bond_sgno(args.output_dir / f"bond_sgno_epoch_{epoch:03d}.pt", bond_sgno)
+    for epoch in range(1, a.epochs + 1):
+        log.info("epoch %d: %s", epoch, train_epoch(loader, trainer, optimiser, bond, bond_optimiser, a))
+        save_checkpoint(a.output_dir / f"epoch_{epoch:03d}.pt", trainer.wrapper, config, vocab, epoch=epoch, max_peaks=a.max_peaks, sqrt_intensity=a.sqrt_intensity)
+        if bond:
+            save_bond_sgno(a.output_dir / f"bond_sgno_epoch_{epoch:03d}.pt", bond.sgno)
     return 0
 
 

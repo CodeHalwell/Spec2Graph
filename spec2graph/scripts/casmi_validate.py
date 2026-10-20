@@ -1,19 +1,8 @@
-"""Molecule-disjoint validation under the novelty scenarios, optional ranker fit.
+"""Validate on held-out molecules under both novelty scenarios; optionally fit the ranker on half of them.
 
-Usage::
-
-    python -m spec2graph.scripts.casmi_validate \\
-        --checkpoint runs/casmi/epoch_010.pt \\
-        --pool assets/casmi/pool.npz \\
-        --train-parquet data/train.parquet \\
-        --holdout-keys runs/casmi/holdout_keys.json \\
-        --fit-ranker runs/casmi/ranker.json \\
-        --output runs/casmi/validation.json
-
-The held-out molecules are split in two: the ranker is fitted on one half
-and every reported number comes from the other, so the MRR is not inflated
-by fitting and scoring on the same molecules. ``--bond-sgno`` enables de
-novo candidates for the ``novel_structure`` scenario.
+python -m spec2graph.scripts.casmi_validate --checkpoint runs/casmi/epoch_010.pt --pool assets/casmi/pool.npz \\
+    --train-parquet data/train.parquet --holdout-keys runs/casmi/holdout_keys.json --fit-ranker runs/casmi/ranker.json \\
+    [--bond-sgno runs/casmi/bond_sgno_epoch_010.pt] --output runs/casmi/validation.json
 """
 
 from __future__ import annotations
@@ -21,107 +10,64 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from spec2graph.casmi.conditioning import load_checkpoint
-from spec2graph.casmi.data import PeakPreprocessConfig, load_casmi_parquet
-from spec2graph.casmi.denovo import DeNovoConfig, load_bond_sgno, make_denovo_fn
-from spec2graph.casmi.pool import CandidatePool
-from spec2graph.casmi.predict import PredictConfig, predict_frame
+from spec2graph.casmi import data, validation
+from spec2graph.casmi.predict import Predictor
 from spec2graph.casmi.ranker import LinearRanker
-from spec2graph.casmi.scoring import ScoringConfig
-from spec2graph.casmi.validation import (
-    add_inchikey14_column,
-    molecule_disjoint_split,
-    novelty_scenarios,
-    ranker_training_groups,
-    run_validation,
-    split_frame,
-    truth_map,
-)
-from spec2graph.casmi.conditioning import CasmiTrainer
+from spec2graph.casmi.scoring import FEATURES
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate Spec2Graph on held-out CASMI molecules.")
-    parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--pool", required=True, type=Path)
-    parser.add_argument("--train-parquet", required=True, type=Path)
-    parser.add_argument("--holdout-keys", type=Path, default=None, help="JSON list from casmi_train; otherwise a fresh split is drawn.")
-    parser.add_argument("--holdout-fraction", type=float, default=0.05)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--limit-molecules", type=int, default=None)
-    parser.add_argument("--ranker", type=Path, default=None, help="Existing ranker.json to evaluate.")
-    parser.add_argument("--fit-ranker", type=Path, default=None, help="Fit a ranker on half the holdout and save it here.")
-    parser.add_argument("--bond-sgno", type=Path, default=None)
-    parser.add_argument("--ppm", type=float, default=10.0)
-    parser.add_argument("--n-samples", type=int, default=8)
-    parser.add_argument("--n-steps", type=int, default=50)
-    parser.add_argument("--no-projection", action="store_true")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--output", required=True, type=Path)
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:  # pragma: no cover - wiring only
-    args = _parse_args(argv)
+def main(argv=None) -> int:  # pragma: no cover - wiring only
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    for name in ("--checkpoint", "--pool", "--train-parquet", "--output"):
+        p.add_argument(name, required=True, type=Path)
+    for name in ("--holdout-keys", "--ranker", "--fit-ranker", "--bond-sgno"):
+        p.add_argument(name, type=Path, default=None)
+    p.add_argument("--holdout-fraction", type=float, default=0.05)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--limit-molecules", type=int, default=None)
+    p.add_argument("--ppm", type=float, default=10.0)
+    p.add_argument("--n-samples", type=int, default=8)
+    p.add_argument("--n-steps", type=int, default=50)
+    p.add_argument("--no-projection", action="store_true")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-    bundle = load_checkpoint(args.checkpoint, device=args.device)
-    trainer = CasmiTrainer(bundle.model, bundle.trainer_config, device=args.device)
-    pool = CandidatePool.load(args.pool)
-    max_peaks = int(bundle.extra.get("max_peaks", bundle.model.core.max_peaks))
-    peak_config = PeakPreprocessConfig(top_k_peaks=max_peaks, max_peaks=max_peaks, sqrt_intensity=bool(bundle.extra.get("sqrt_intensity", False)))
+    predictor = Predictor.load(a.checkpoint, a.pool, a.ranker, a.bond_sgno, a.device, ppm=a.ppm, n_samples=a.n_samples,
+                               n_steps=a.n_steps, use_projection=not a.no_projection)
+    train = validation.with_keys(data.load(a.train_parquet, require_smiles=True))
+    keys = set(json.loads(a.holdout_keys.read_text())) if a.holdout_keys else validation.split_keys(train["inchikey14"], a.holdout_fraction, a.seed)[1]
+    _, holdout = validation.split_frame(train, keys)
+    molecules = list(dict.fromkeys(holdout["molecule_id"]))
+    np.random.default_rng(a.seed).shuffle(molecules)
+    molecules = molecules[: a.limit_molecules]
+    half = len(molecules) // 2 if a.fit_ranker else 0
+    frame = lambda ids: holdout[holdout["molecule_id"].isin(ids)].reset_index(drop=True)
 
-    train = add_inchikey14_column(load_casmi_parquet(args.train_parquet, require_smiles=True))
-    if args.holdout_keys is not None:
-        holdout_keys = set(json.loads(args.holdout_keys.read_text()))
-    else:
-        _, holdout_keys = molecule_disjoint_split(train["inchikey14"], holdout_fraction=args.holdout_fraction, seed=args.seed)
-    _, holdout = split_frame(train, holdout_keys)
-    molecule_ids = list(dict.fromkeys(holdout["molecule_id"]))
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(molecule_ids)
-    if args.limit_molecules:
-        molecule_ids = molecule_ids[: args.limit_molecules]
-    half = len(molecule_ids) // 2
-    fit_ids, eval_ids = set(molecule_ids[:half]), set(molecule_ids[half:]) if args.fit_ranker else set(molecule_ids)
-    logger.info("Holdout molecules: %d (fit %d, eval %d)", len(molecule_ids), len(fit_ids) if args.fit_ranker else 0, len(eval_ids))
-
-    config = PredictConfig(
-        scoring=ScoringConfig(ppm=args.ppm, n_samples=args.n_samples, n_steps=args.n_steps, use_projection=not args.no_projection),
-        peak_config=peak_config,
-        max_peaks=max_peaks,
-        denovo=args.bond_sgno is not None,
-    )
-    denovo_fn = make_denovo_fn(load_bond_sgno(args.bond_sgno, device=args.device), DeNovoConfig(n_steps=args.n_steps)) if args.bond_sgno else None
-
-    ranker = LinearRanker.load(args.ranker) if args.ranker else LinearRanker.heuristic()
-    if args.fit_ranker:
-        fit_frame = holdout[holdout["molecule_id"].isin(fit_ids)].reset_index(drop=True)
-        _, scores = predict_frame(trainer, pool, fit_frame, adduct_vocab=bundle.adduct_vocab, ranker=ranker, config=config, progress=True, collect_scores=True)
-        groups = ranker_training_groups(scores, pool, truth_map(fit_frame))
-        logger.info("Fitting ranker on %d molecules with the answer in window", len(groups))
+    if a.fit_ranker:
+        fit = frame(molecules[:half])
+        _, scores = predictor.predict_frame(fit, progress=True)
+        groups = validation.training_groups(scores, predictor.pool, validation.truth_map(fit))
         try:
-            ranker = LinearRanker.fit(groups, init=ranker)
+            predictor.ranker = LinearRanker.fit(groups, init=predictor.ranker)
         except ValueError as exc:
-            logger.warning("Ranker not fitted (%s); keeping the current weights.", exc)
-        ranker.save(args.fit_ranker)
-        logger.info("Ranker weights: %s", dict(zip(ranker.feature_names, np.round(ranker.weights, 3))))
+            log.warning("ranker not fitted (%s); keeping the current weights", exc)
+        predictor.ranker.save(a.fit_ranker)
+        log.info("ranker weights: %s", dict(zip(FEATURES, np.round(predictor.ranker.weights, 3))))
 
-    eval_frame = holdout[holdout["molecule_id"].isin(eval_ids)].reset_index(drop=True)
-    reports = run_validation(
-        trainer, pool, eval_frame, adduct_vocab=bundle.adduct_vocab, ranker=ranker, config=config, denovo_fn=denovo_fn, progress=True
-    )
+    reports = validation.validate(predictor, frame(molecules[half:]), progress=True)
     for report in reports.values():
         print(report)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({name: r.to_dict() for name, r in reports.items()}, indent=2))
+    a.output.parent.mkdir(parents=True, exist_ok=True)
+    a.output.write_text(json.dumps({k: asdict(r) for k, r in reports.items()}, indent=2))
     return 0
 
 

@@ -40,15 +40,17 @@ with degenerate eigenvalues). Instead train on the subspace-invariant projection
     decode), `ddim.py` (DDIM sampler).
   - `train/sgno_trainer.py` — `SGNOTrainer` for adjacency supervision of the SGNO.
   - `casmi/` — the Enveda CASMI 2026 competition layer (see `docs/17`).
-    `metric.py` (official InChIKey14 / MRR@25 scoring + submission rules),
-    `adducts.py` (neutral mass from precursor m/z + adduct), `data.py`
-    (Kaggle parquet schema, structure table, `CasmiSpectrumDataset`,
-    `CasmiBatch`), `spectral.py` (Laplacian spectral quantiles,
-    `SpectralCache`), `pool.py` (`CandidatePool`, ppm retrieval),
-    `conditioning.py` (`CasmiModel` wrapper + `CasmiTrainer`), `scoring.py`
-    (candidate features incl. Sinkhorn-aligned projection overlap),
-    `ranker.py`, `predict.py`, `validation.py` (novelty classes),
-    `denovo.py` (`BondTypeSGNO`, formula enumeration).
+    `chem.py` (shared RDKit helpers), `metric.py` (InChIKey14 / MRR@25 +
+    `Submission`), `adducts.py` (neutral mass, `AdductVocabulary`), `data.py`
+    (parquet schema, `Peaks`, `structures`, `Conditioning`, `Spectra`,
+    `Dataset`, `Collator`), `spectral.py` (spectral quantiles,
+    `SpectralCache`), `pool.py` (`CandidatePool`), `conditioning.py`
+    (`CasmiModel` wrapper + `CasmiTrainer`, `heads_only` proxy mode),
+    `scoring.py` (`Scorer`, Sinkhorn-aligned projection overlap),
+    `ranker.py` (`LinearRanker`), `predict.py` (`Predictor`),
+    `validation.py` (novelty classes), `denovo.py` (`BondTypeSGNO`,
+    `DeNovo`, formula enumeration). Keep functions under cognitive
+    complexity 15 (`complexipy spec2graph/casmi`).
   - `scripts/` — CLI entry points (see Commands).
 - **`docs/`** — 15 numbered walkthroughs of each pipeline stage, cross-referenced
   to `spectral_diffusion.py` by `path:line`. Start at `docs/README.md`.

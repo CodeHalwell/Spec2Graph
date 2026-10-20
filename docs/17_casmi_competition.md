@@ -46,15 +46,18 @@ spectra of one molecule ──► CasmiModel.encode ──► conditioned memory
   `memory` argument. Every core head is reused unchanged; one new head
   predicts the Laplacian **spectral quantiles**. `CasmiTrainer` subclasses
   `DiffusionTrainer`, sharing the DDPM schedule and helpers, and overrides
-  only the loss assembly and the samplers.
+  only the loss assembly and the samplers. `CasmiTrainerConfig.heads_only`
+  is a **proxy mode**: it trains the encoder and the fingerprint,
+  atom-count and quantile heads without the denoiser, so the conditioning
+  and data pipeline can be checked in minutes before a diffusion run.
 * **Spectral quantiles** (`spectral.py`). The eigenvalue spectrum of the
   normalised Laplacian resampled at fixed quantile levels: permutation- and
   size-invariant, so it can be compared with any candidate without an atom
   correspondence. Bipartite (odd-ring-free) graphs have λ_max = 2, pendant
   groups raise the multiplicity of λ = 1, so it carries real topology.
-* **Projection overlap** (`scoring.py`). Because the score is linear in
-  `P`, averaging per-sample projections gives a legitimate expected
-  projection `P̂`. Candidates are compared through
+* **Projection overlap** (`scoring.py`, class `Scorer`). Because the score
+  is linear in `P`, averaging per-sample projections gives a legitimate
+  expected projection `P̂`. Candidates are compared through
   `max_Π <Πᵀ P̂ Π, P_c>` with `Π` found by Sinkhorn ascent seeded by the
   atom-type head and rounded to a permutation with the Hungarian algorithm.
   The same alignment yields an element log-likelihood, a learned
@@ -64,24 +67,28 @@ spectra of one molecule ──► CasmiModel.encode ──► conditioned memory
 * **Candidate pool** (`pool.py`). Mass-sorted structures with precomputed
   `V_k`, elements, quantiles and packed fingerprints; `searchsorted`
   retrieval in a ppm window; saved without pickling.
-* **Ranker** (`ranker.py`). Standardised features, mean imputation, a
-  linear score trained listwise (softmax over each molecule's candidates)
-  on held-out molecules. Heuristic weights work before any fit.
+* **Ranker and prediction** (`ranker.py`, `predict.py`). `LinearRanker`:
+  standardised features, mean imputation, a linear score trained listwise
+  (softmax over each molecule's candidates) on held-out molecules, with
+  heuristic weights before any fit. `Predictor` runs score, rank, de novo
+  fill and mass-nearest top-up per molecule inside a try/except and writes
+  the `Submission`; `Predictor.load` builds it from files.
 * **De novo** (`denovo.py`). `BondTypeSGNO` predicts four bond classes per
-  atom pair (the core SGNO is binary), `decode_bond_types` enforces
-  valence and the formula's hydrogen budget, `enumerate_formulas` proposes
-  CHNOPS(+halogen) formulas within a ppm window, and `denovo_candidates`
-  samples, assigns elements with the core Hungarian step and ranks by
+  atom pair (the core SGNO is binary), `decode` enforces valence and the
+  formula's hydrogen budget, `enumerate_formulas` proposes CHNOPS(+halogen)
+  formulas within a ppm window, and `DeNovo` samples, assigns elements with
+  the core Hungarian step, rejects disconnected graphs and ranks by
   frequency. Hooked into prediction behind `--bond-sgno`.
-* **Metric** (`metric.py`). Tautomer canonicalisation + InChIKey14, MRR@25,
-  and a submission writer that enforces the rejection rules. Standard InChI
-  puts (de)protonation in the `/p` layer, so an acid and its anion share a
-  key.
+* **Metric** (`metric.py`, `chem.py`). Tautomer canonicalisation +
+  InChIKey14, MRR@25, and a `Submission` class that enforces the rejection
+  rules. Standard InChI puts (de)protonation in the `/p` layer, so an acid
+  and its anion share a key. `chem.py` holds the shared RDKit helpers
+  (length-guarded parsing, structure records, kekulised adjacency).
 
 ## Validation
 
 `validation.py` splits by structure (InChIKey14) and simulates the hidden
-test set's novelty classes on the held-out molecules:
+test set's novelty classes on the held-out molecules (`validate`):
 
 | Scenario | Meaning | Who can score |
 |---|---|---|
@@ -122,7 +129,8 @@ python -m spec2graph.scripts.casmi_predict \
 ```
 
 All four are idempotent and runnable on CPU for development (`--max-train-rows`,
-`--limit`, `--n-steps`).
+`--limit`, `--n-steps`, `--heads-only`). Cognitive complexity is kept under
+15 per function: `complexipy spec2graph/casmi`.
 
 ## Data handling
 
@@ -140,7 +148,7 @@ non-commercial restriction.
   i.e. for any molecule with fewer heavy atoms than `k`. `CasmiTrainer`
   overrides `projection_from_embeddings` with `V (VᵀV + εI)⁻¹ Vᵀ`, identical
   up to `1/(1+ε)` at full rank and differentiable always. The core is
-  unchanged; see `tests/test_casmi_conditioning.py::TestTrainer::test_rank_safe_projector`.
+  unchanged; see `tests/test_casmi_model.py::test_rank_safe_projector`.
 * **Multiple spectra per molecule** are aggregated by averaging head outputs
   and pooling eigenvector draws across spectra. A joint set encoder over the
   collision-energy series is the natural next step.

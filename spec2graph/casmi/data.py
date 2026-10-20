@@ -1,794 +1,274 @@
-"""Competition data: parquet schema, preprocessing, structures, dataset, collator.
-
-The Kaggle release ships ``train.parquet`` (spectra with answers) and
-``test.parquet`` (spectra only). Column names are normalised through
-:data:`COLUMN_ALIASES` so the rest of the layer can rely on::
-
-    molecule_id, precursor_mz, adduct, collision_energy, mzs, intensities,
-    smiles (train only), instrument, library
-
-Derived columns added by :func:`load_casmi_parquet`:
-
-* ``adduct_canonical`` — canonical adduct spelling (``None`` when unparseable);
-* ``neutral_mass`` — monoisotopic neutral mass from precursor m/z and adduct;
-* ``polarity`` — ``+1`` / ``-1``.
-
-Structures are identified by tautomer-canonical InChIKey14 everywhere, the
-same identity the metric uses. :func:`build_structure_table` produces one
-row per structure with formula, exact mass and heavy-atom count.
-
-:class:`CasmiSpectrumDataset` yields the sample dict the core collators
-expect (``eigvecs``, ``mz``, ``intensity``, ``fingerprint``, ``atom_types``
-...) plus the conditioning fields, and :func:`make_casmi_collator` wraps the
-core collator so the model sees a :class:`CasmiBatch`.
-
-Competition data is CC BY-NC 4.0: never commit the parquet files or the
-caches derived from them.
-"""
+"""Competition data: schema, peak cleaning, structure table, conditioning tensors, dataset and collator."""
 
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import Dataset as TorchDataset
 
-from spec2graph.casmi.adducts import AdductVocabulary, canonical_adduct_name, neutral_mass, try_parse_adduct
-from spec2graph.casmi.metric import inchikey14
-from spec2graph.casmi.spectral import DEFAULT_N_QUANTILES, SpectralCache, spectral_quantiles
+from spec2graph.casmi import chem
+from spec2graph.casmi.adducts import AdductVocabulary, neutral_mass, try_parse
+from spec2graph.casmi.spectral import N_QUANTILES, SpectralCache, quantiles
 from spec2graph.data.collate import make_training_batch_collator
 from spec2graph.data.elements import atom_types_to_indices
 from spec2graph.data.massspecgym import parse_peak_list
-from spectral_diffusion import MAX_SMILES_LENGTH, TrainingBatch
-
-try:
-    from torch.utils.data import Dataset as _TorchDataset
-except ImportError:  # pragma: no cover - torch is a hard dependency
-    _TorchDataset = object
+from spectral_diffusion import TrainingBatch
 
 logger = logging.getLogger(__name__)
 
-COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+ALIASES = {
     "molecule_id": ("molecule_id",),
-    "spectrum_id": ("spectrum_id", "spec_id", "id"),
-    "precursor_mz": ("precursor_mz", "precursor_m_z", "precursormz", "precursor"),
-    "adduct": ("adduct", "precursor_type", "ionization"),
+    "precursor_mz": ("precursor_mz", "precursormz", "precursor"),
+    "adduct": ("adduct", "precursor_type"),
     "collision_energy": ("collision_energy_ev", "collision_energy", "ce", "nce"),
-    "mzs": ("ms2_mzs", "mzs", "peaks_mz", "mz"),
-    "intensities": (
-        "ms2_normalized_intensities",
-        "ms2_intensities",
-        "intensities",
-        "peaks_intensity",
-        "intensity",
-    ),
+    "mzs": ("ms2_mzs", "mzs", "mz"),
+    "intensities": ("ms2_normalized_intensities", "ms2_intensities", "intensities", "intensity"),
     "smiles": ("normalized_smiles", "smiles", "canonical_smiles"),
     "instrument": ("instrument_type", "instrument"),
     "library": ("ingest_lib", "library", "source"),
 }
-REQUIRED_SPECTRUM_COLUMNS: tuple[str, ...] = ("molecule_id", "precursor_mz", "adduct", "mzs", "intensities")
-STRUCTURE_COLUMNS: tuple[str, ...] = (
-    "smiles",
-    "inchikey",
-    "inchikey14",
-    "formula",
-    "exact_mass",
-    "n_heavy_atoms",
-)
+REQUIRED = ("molecule_id", "precursor_mz", "adduct", "mzs", "intensities")
 
 
-# ----------------------------------------------------------------------
-# Loading
-# ----------------------------------------------------------------------
+def prepare(df: pd.DataFrame, require_smiles: bool = False) -> pd.DataFrame:
+    """Canonical column names plus ``neutral_mass`` (NaN when the adduct is unsupported) and ``polarity``."""
+    lower = {str(c).lower(): c for c in df.columns}
+    rename = {}
+    for canon, aliases in ALIASES.items():
+        if canon not in df.columns and (found := next((lower[a] for a in aliases if a in lower), None)):
+            rename[found] = canon
+    out = df.rename(columns=rename).copy()
+    if missing := [c for c in REQUIRED + (("smiles",) if require_smiles else ()) if c not in out.columns]:
+        raise RuntimeError(f"competition schema mismatch; missing {missing}")
+    if "collision_energy" not in out.columns:
+        out["collision_energy"] = np.nan
+    out["molecule_id"] = out["molecule_id"].astype(str)
+    out["neutral_mass"] = [neutral_mass(mz, a) for mz, a in zip(out["precursor_mz"], out["adduct"])]
+    out["polarity"] = [a.polarity if (a := try_parse(ad)) else 0 for ad in out["adduct"]]
+    return out.reset_index(drop=True)
 
 
-def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename known aliases to canonical column names (copy, other columns kept)."""
-    rename: dict[str, str] = {}
-    lower_to_actual = {str(c).lower(): c for c in df.columns}
-    for canonical, aliases in COLUMN_ALIASES.items():
-        if canonical in df.columns:
-            continue
-        for alias in aliases:
-            actual = lower_to_actual.get(alias.lower())
-            if actual is not None and actual not in rename:
-                rename[actual] = canonical
-                break
-    return df.rename(columns=rename).copy()
+def load(path: str | Path, require_smiles: bool = False) -> pd.DataFrame:
+    return prepare(pd.read_parquet(path), require_smiles)
 
 
-def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ``adduct_canonical``, ``neutral_mass`` and ``polarity`` (copy)."""
-    out = df.copy()
-    adducts = out["adduct"].astype(object)
-    out["adduct_canonical"] = pd.Series(
-        [canonical_adduct_name(a) if isinstance(a, str) else None for a in adducts],
-        index=out.index,
-        dtype=object,
-    )
-    precursor = pd.to_numeric(out["precursor_mz"], errors="coerce")
-    masses = np.full(len(out), np.nan, dtype=np.float64)
-    polarity = np.zeros(len(out), dtype=np.int8)
-    for i, (mz, adduct) in enumerate(zip(precursor.to_numpy(), adducts)):
-        parsed = try_parse_adduct(adduct)
-        if parsed is None or not np.isfinite(mz) or mz <= 0:
-            continue
-        masses[i] = parsed.neutral_mass(float(mz))
-        polarity[i] = parsed.polarity
-    out["neutral_mass"] = masses
-    out["polarity"] = polarity
-    return out
-
-
-def load_casmi_parquet(
-    path: str | Path,
-    *,
-    columns: Optional[Sequence[str]] = None,
-    require_smiles: bool = False,
-) -> pd.DataFrame:
-    """Read a competition parquet file into the canonical schema."""
-    df = pd.read_parquet(path, columns=list(columns) if columns else None)
-    return prepare_spectra_frame(df, require_smiles=require_smiles)
-
-
-def prepare_spectra_frame(df: pd.DataFrame, *, require_smiles: bool = False) -> pd.DataFrame:
-    """Normalise an in-memory frame (used by tests and by the loader)."""
-    df = normalise_columns(df)
-    missing = [c for c in REQUIRED_SPECTRUM_COLUMNS if c not in df.columns]
-    if require_smiles and "smiles" not in df.columns:
-        missing.append("smiles")
-    if missing:
-        raise RuntimeError(
-            f"Competition schema mismatch; missing {missing}. Columns: {list(df.columns)}"
-        )
-    if "collision_energy" not in df.columns:
-        df["collision_energy"] = np.nan
-    df["molecule_id"] = df["molecule_id"].astype(str)
-    df = add_derived_columns(df)
-    return df.reset_index(drop=True)
-
-
-def group_by_molecule(df: pd.DataFrame) -> dict[str, np.ndarray]:
-    """``molecule_id -> row positions`` preserving file order."""
-    groups: dict[str, list[int]] = {}
-    for position, molecule_id in enumerate(df["molecule_id"].astype(str).to_numpy()):
-        groups.setdefault(molecule_id, []).append(position)
-    return {key: np.asarray(value, dtype=np.int64) for key, value in groups.items()}
-
-
-# ----------------------------------------------------------------------
-# Peak preprocessing
-# ----------------------------------------------------------------------
+def by_molecule(df: pd.DataFrame) -> dict[str, np.ndarray]:
+    """``molecule_id -> row positions`` in file order."""
+    return dict(df.reset_index(drop=True).groupby("molecule_id", sort=False).indices)
 
 
 @dataclass
-class PeakPreprocessConfig:
-    """Spectrum cleaning applied identically at train and test time."""
+class Peaks:
+    """Spectrum cleaning shared by training and inference."""
 
-    top_k_peaks: int = 128
-    max_peaks: int = 128
-    # Drop peaks at or above ``precursor_mz - precursor_window`` (precursor echo).
+    top_k: int = 128
     precursor_window: float = 0.5
-    # Drop peaks below this fraction of the base peak after normalisation.
-    min_relative_intensity: float = 0.0
-    # Square-root compress intensities (common in spectral similarity work).
-    sqrt_intensity: bool = False
     min_peaks: int = 3
+    sqrt_intensity: bool = False
 
-
-def preprocess_peaks(
-    mz: np.ndarray,
-    intensity: np.ndarray,
-    precursor_mz: float,
-    config: Optional[PeakPreprocessConfig] = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Clean one spectrum. Returns arrays sorted by m/z, intensities in [0, 1]."""
-    config = config or PeakPreprocessConfig()
-    mz = np.asarray(mz, dtype=np.float32).ravel()
-    intensity = np.asarray(intensity, dtype=np.float32).ravel()
-    if mz.shape != intensity.shape:
-        raise ValueError(f"mz and intensity length mismatch: {mz.shape} vs {intensity.shape}.")
-    keep = np.isfinite(mz) & np.isfinite(intensity) & (intensity > 0) & (mz > 0)
-    if np.isfinite(precursor_mz) and precursor_mz > 0:
-        keep &= mz < (float(precursor_mz) - config.precursor_window)
-    mz, intensity = mz[keep], intensity[keep]
-    if mz.size == 0:
-        return mz, intensity
-    intensity = intensity / intensity.max()
-    if config.min_relative_intensity > 0:
-        keep = intensity >= config.min_relative_intensity
+    def clean(self, mz: np.ndarray, intensity: np.ndarray, precursor_mz: float) -> tuple[np.ndarray, np.ndarray]:
+        """Drop the precursor echo and junk peaks, keep the top-k by intensity, sort by m/z, scale to a base peak of 1."""
+        mz, intensity = np.asarray(mz, np.float32).ravel(), np.asarray(intensity, np.float32).ravel()
+        if mz.shape != intensity.shape:
+            raise ValueError("mz/intensity length mismatch")
+        keep = np.isfinite(mz) & np.isfinite(intensity) & (intensity > 0) & (mz > 0)
+        if np.isfinite(precursor_mz):
+            keep &= mz < precursor_mz - self.precursor_window
         mz, intensity = mz[keep], intensity[keep]
-    if mz.size > config.top_k_peaks:
-        top = np.argpartition(intensity, -config.top_k_peaks)[-config.top_k_peaks :]
-        mz, intensity = mz[top], intensity[top]
-    order = np.argsort(mz, kind="stable")
-    mz, intensity = mz[order], intensity[order]
-    if mz.size > config.max_peaks:
-        mz, intensity = mz[: config.max_peaks], intensity[: config.max_peaks]
-    if config.sqrt_intensity:
-        intensity = np.sqrt(intensity)
-    return mz.astype(np.float32), intensity.astype(np.float32)
+        if mz.size > self.top_k:
+            top = np.argpartition(intensity, -self.top_k)[-self.top_k:]
+            mz, intensity = mz[top], intensity[top]
+        if mz.size == 0:
+            return mz, intensity
+        order = np.argsort(mz, kind="stable")
+        mz, intensity = mz[order], intensity[order] / intensity.max()
+        return mz, np.sqrt(intensity) if self.sqrt_intensity else intensity
+
+    def from_row(self, row: dict) -> tuple[np.ndarray, np.ndarray]:
+        return self.clean(parse_peak_list(row["mzs"]), parse_peak_list(row["intensities"]), float(row["precursor_mz"]))
 
 
-def _safe_float(value: object) -> float:
-    try:
-        if value is None:
-            return float("nan")
-        out = float(value)
-    except (TypeError, ValueError):
-        return float("nan")
-    return out
+def structures(smiles: Iterable[object], canonical_tautomer: bool = False, n_jobs: int = 1, progress: bool = False,
+               source: Optional[str] = None) -> pd.DataFrame:
+    """One row per InChIKey14: identity, formula, exact mass, heavy-atom count and how many inputs mapped to it."""
+    counts = Counter(s for s in smiles if isinstance(s, str) and s)
+    records = chem.parallel_map(partial(chem.record, canonical_tautomer=canonical_tautomer), counts, n_jobs, progress, "structures")
+    rows: dict[str, dict] = {}
+    for smi, rec in zip(counts, records):
+        if rec is not None:
+            row = rows.setdefault(rec["inchikey14"], {**rec, "input_smiles": smi, "n_inputs": 0, "source": source})
+            row["n_inputs"] += counts[smi]
+    return pd.DataFrame(list(rows.values()))
 
 
-# ----------------------------------------------------------------------
-# Structures
-# ----------------------------------------------------------------------
-
-
-def structure_record(smiles: object, *, canonical_tautomer: bool = False) -> Optional[dict[str, Any]]:
-    """Identity and bulk properties of one structure, or ``None`` if unparseable.
-
-    ``inchikey`` is the full key of the parsed molecule (used for cache
-    paths); ``inchikey14`` is the tautomer-canonical first block (the
-    competition identity). With ``canonical_tautomer=True`` the returned
-    ``smiles`` is RDKit's canonical tautomer, which keeps one spelling per
-    structure in the candidate pool.
-    """
-    if not isinstance(smiles, str) or not smiles.strip() or len(smiles) > MAX_SMILES_LENGTH:
-        return None
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import Descriptors, rdMolDescriptors
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError("rdkit is required for structure_record()") from exc
-    from spec2graph.casmi.metric import _get_tautomer_enumerator, _quiet_rdkit
-
-    with _quiet_rdkit():
-        mol = Chem.MolFromSmiles(smiles.strip())
-        if mol is None or mol.GetNumAtoms() == 0:
-            return None
-        if canonical_tautomer:
-            try:
-                mol = _get_tautomer_enumerator().Canonicalize(mol)
-            except Exception:  # RDKit native exception
-                pass
-        try:
-            key = Chem.MolToInchiKey(mol)
-            canonical = Chem.MolToSmiles(mol)
-            formula = rdMolDescriptors.CalcMolFormula(mol)
-            exact_mass = float(Descriptors.ExactMolWt(mol))
-        except Exception:
-            return None
-    if not key:
-        return None
-    key14 = inchikey14(canonical)
-    if key14 is None:
-        return None
-    return {
-        "smiles": canonical,
-        "inchikey": key,
-        "inchikey14": key14,
-        "formula": formula,
-        "exact_mass": exact_mass,
-        "n_heavy_atoms": int(mol.GetNumHeavyAtoms()),
-    }
-
-
-def build_structure_table(
-    smiles: Iterable[object],
-    *,
-    canonical_tautomer: bool = False,
-    n_jobs: int = 1,
-    show_progress: bool = False,
-    source: Optional[str] = None,
-) -> pd.DataFrame:
-    """One row per distinct InChIKey14 with :data:`STRUCTURE_COLUMNS`.
-
-    ``n_inputs`` counts how many input SMILES mapped to each structure
-    (for the training set that is the number of spectra). The first SMILES
-    seen for a structure provides its representative spelling.
-    """
-    unique: dict[str, int] = {}
-    for value in smiles:
-        if isinstance(value, str) and value:
-            unique[value] = unique.get(value, 0) + 1
-    inputs = list(unique.keys())
-
-    iterator: Iterable[str] = inputs
-    if show_progress:
-        try:
-            from tqdm.auto import tqdm
-
-            iterator = tqdm(inputs, desc="structures", unit="smiles")
-        except ImportError:
-            pass
-
-    if n_jobs == 1:
-        records = [structure_record(s, canonical_tautomer=canonical_tautomer) for s in iterator]
-    else:
-        try:
-            from joblib import Parallel, delayed
-
-            records = Parallel(n_jobs=n_jobs, prefer="processes", batch_size=256)(
-                delayed(structure_record)(s, canonical_tautomer=canonical_tautomer) for s in iterator
-            )
-        except ImportError:
-            logger.warning("joblib not installed; building the structure table serially.")
-            records = [structure_record(s, canonical_tautomer=canonical_tautomer) for s in inputs]
-
-    rows: dict[str, dict[str, Any]] = {}
-    failed = 0
-    for original, record in zip(inputs, records):
-        if record is None:
-            failed += 1
-            continue
-        key = record["inchikey14"]
-        if key in rows:
-            rows[key]["n_inputs"] += unique[original]
-            continue
-        record = dict(record)
-        record["input_smiles"] = original
-        record["n_inputs"] = unique[original]
-        if source is not None:
-            record["source"] = source
-        rows[key] = record
-    if failed:
-        logger.info("build_structure_table: %d of %d SMILES could not be parsed.", failed, len(inputs))
-    columns = list(STRUCTURE_COLUMNS) + ["input_smiles", "n_inputs"] + (["source"] if source else [])
-    table = pd.DataFrame(list(rows.values()), columns=columns)
-    return table.reset_index(drop=True)
-
-
-def merge_structure_tables(tables: Sequence[pd.DataFrame]) -> pd.DataFrame:
-    """Concatenate tables keeping the first row per InChIKey14."""
-    if not tables:
-        raise ValueError("No structure tables to merge.")
-    merged = pd.concat(list(tables), ignore_index=True)
-    merged = merged.drop_duplicates(subset=["inchikey14"], keep="first")
-    return merged.reset_index(drop=True)
-
-
-# ----------------------------------------------------------------------
-# Dataset
-# ----------------------------------------------------------------------
+def merge_structures(tables: Iterable[pd.DataFrame]) -> pd.DataFrame:
+    return pd.concat(list(tables), ignore_index=True).drop_duplicates("inchikey14").reset_index(drop=True)
 
 
 @dataclass
-class DatasetFilterStats:
-    initial: int
-    dropped_no_smiles: int = 0
-    dropped_bad_adduct: int = 0
-    dropped_unparseable: int = 0
-    dropped_too_many_atoms: int = 0
-    dropped_few_peaks: int = 0
-    dropped_cache: int = 0
-    final: int = 0
+class Conditioning:
+    """Per-spectrum conditioning tensors, all shaped ``(batch,)``."""
 
-    def __str__(self) -> str:
-        parts = [f"{self.initial} initial"]
-        for name in (
-            "dropped_no_smiles",
-            "dropped_bad_adduct",
-            "dropped_unparseable",
-            "dropped_too_many_atoms",
-            "dropped_few_peaks",
-            "dropped_cache",
-        ):
-            value = getattr(self, name)
-            if value:
-                parts.append(f"-{value} {name[len('dropped_'):]}")
-        parts.append(f"={self.final}")
-        return " ".join(parts)
+    adduct_index: torch.Tensor
+    collision_energy: torch.Tensor
+    collision_energy_mask: torch.Tensor
+    neutral_mass: torch.Tensor
+    polarity: torch.Tensor
+
+    @classmethod
+    def build(cls, adduct_index, collision_energy, neutral_mass, polarity, device: str | torch.device = "cpu") -> "Conditioning":
+        """From Python lists; ``None``/NaN collision energies are masked out."""
+        ce = torch.tensor([float("nan") if v is None else float(v) for v in collision_energy], dtype=torch.float32, device=device)
+        mask = torch.isfinite(ce)
+        as_t = lambda values, dtype: torch.tensor(list(values), dtype=dtype, device=device)
+        return cls(as_t(adduct_index, torch.long), ce.masked_fill(~mask, 0.0), mask, as_t(neutral_mass, torch.float32), as_t(polarity, torch.float32))
+
+    def map(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Conditioning":
+        return Conditioning(*(fn(t) for t in vars(self).values()))
+
+    def to(self, device) -> "Conditioning":
+        return self.map(lambda t: t.to(device))
+
+    def select(self, idx: torch.Tensor) -> "Conditioning":
+        return self.map(lambda t: t.index_select(0, idx.to(t.device)))
 
 
-class CasmiSpectrumDataset(_TorchDataset):
-    """Training/validation dataset over competition spectra.
+@dataclass
+class Spectra:
+    """Padded peaks plus conditioning for a set of spectra (usually one molecule)."""
 
-    Each item is a dict with the fields the core collator needs
-    (``eigvecs``, ``n_atoms``, ``mz``, ``intensity``, ``precursor_mz``,
-    ``fingerprint``, ``atom_types``, ``atom_symbols``, ``smiles``,
-    ``formula``, ``inchikey``) plus ``inchikey14``, ``molecule_id``,
-    ``adduct_index``, ``collision_energy`` (NaN when unknown),
-    ``neutral_mass``, ``polarity`` and ``spectral_quantiles``.
+    mz: torch.Tensor
+    intensity: torch.Tensor
+    mask: torch.Tensor
+    precursor_mz: torch.Tensor
+    cond: Conditioning
+    positions: np.ndarray
 
-    Rows whose structure cannot be processed, whose adduct is unsupported,
-    whose heavy-atom count exceeds ``max_atoms`` or whose spectrum has
-    fewer than ``min_peaks`` usable peaks are dropped at construction.
-    """
+    @property
+    def n(self) -> int:
+        return int(self.mz.shape[0])
 
-    def __init__(
-        self,
-        spectra: pd.DataFrame,
-        *,
-        cache: SpectralCache | str | Path,
-        adduct_vocab: AdductVocabulary,
-        k: int = 8,
-        max_atoms: int = 96,
-        fingerprint_bits: int = 2048,
-        n_quantiles: int = DEFAULT_N_QUANTILES,
-        peak_config: Optional[PeakPreprocessConfig] = None,
-        structures: Optional[pd.DataFrame] = None,
-        include_adjacency: bool = False,
-        precompute: bool = True,
-        n_jobs: int = 1,
-    ) -> None:
-        spectra = normalise_columns(spectra)
-        if "smiles" not in spectra.columns:
-            raise ValueError("CasmiSpectrumDataset needs a 'smiles' column (training data).")
-        if isinstance(cache, (str, Path)):
-            cache = SpectralCache(cache, k=k, fingerprint_bits=fingerprint_bits)
-        if cache.k != k:
-            raise ValueError(f"cache.k={cache.k} does not match k={k}.")
-        self.cache = cache
-        self.k = k
-        self.max_atoms = max_atoms
-        self.fingerprint_bits = fingerprint_bits
-        self.n_quantiles = n_quantiles
-        self.peak_config = peak_config or PeakPreprocessConfig()
-        self.adduct_vocab = adduct_vocab
-        self.include_adjacency = include_adjacency
+    @classmethod
+    def from_rows(cls, rows: pd.DataFrame, vocab: AdductVocabulary, max_peaks: int, peaks: Peaks = Peaks(),
+                  device: str | torch.device = "cpu") -> Optional["Spectra"]:
+        """Clean, pad and condition the usable rows; ``None`` when nothing usable remains."""
+        kept = [(pos, row, *peaks.from_row(row)) for pos, row in enumerate(rows.to_dict("records")) if np.isfinite(row["neutral_mass"])]
+        kept = [(pos, row, mz[:max_peaks], it[:max_peaks]) for pos, row, mz, it in kept if mz.size >= peaks.min_peaks]
+        if not kept:
+            return None
+        rows_ = [r for _, r, _, _ in kept]
+        cond = Conditioning.build([vocab.encode(r["adduct"]) for r in rows_], [r.get("collision_energy") for r in rows_],
+                                  [r["neutral_mass"] for r in rows_], [r["polarity"] for r in rows_], device)
+        mz, it, mask = _pad([m for _, _, m, _ in kept], [x for _, _, _, x in kept])
+        t = lambda a, dtype: torch.as_tensor(a, dtype=dtype, device=device)
+        return cls(t(mz, torch.float32), t(it, torch.float32), t(mask, torch.bool),
+                   t([float(r["precursor_mz"]) for r in rows_], torch.float32), cond, np.array([p for p, _, _, _ in kept]))
 
-        df = spectra if "neutral_mass" in spectra.columns else prepare_spectra_frame(spectra, require_smiles=True)
-        stats = DatasetFilterStats(initial=len(df))
 
-        has_smiles = df["smiles"].apply(lambda s: isinstance(s, str) and bool(s))
-        stats.dropped_no_smiles = int((~has_smiles).sum())
-        df = df[has_smiles]
+def _pad(mzs: list[np.ndarray], intensities: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Right-pad ragged peak lists to ``(n, width)`` arrays plus a validity mask."""
+    width = max(m.size for m in mzs)
+    mz, it, mask = (np.zeros((len(mzs), width), dtype) for dtype in (np.float32, np.float32, bool))
+    for i, (m, x) in enumerate(zip(mzs, intensities)):
+        mz[i, : m.size], it[i, : m.size], mask[i, : m.size] = m, x, True
+    return mz, it, mask
 
-        good_adduct = df["neutral_mass"].notna()
-        stats.dropped_bad_adduct = int((~good_adduct).sum())
-        df = df[good_adduct]
 
-        # Structure lookup: one RDKit pass per distinct SMILES.
-        if structures is None:
-            structures = build_structure_table(df["smiles"].unique(), n_jobs=n_jobs)
-        by_input = {}
-        for row in structures.to_dict("records"):
-            by_input.setdefault(row.get("input_smiles", row["smiles"]), row)
-            by_input.setdefault(row["smiles"], row)
-        records = [by_input.get(s) for s in df["smiles"].to_numpy()]
-        parseable = np.array([r is not None for r in records], dtype=bool)
-        stats.dropped_unparseable = int((~parseable).sum())
-        df = df[parseable]
-        records = [r for r in records if r is not None]
+class Dataset(TorchDataset):
+    """Training spectra with cached spectral targets and the conditioning fields."""
 
-        n_atoms = np.array([r["n_heavy_atoms"] for r in records], dtype=np.int64)
-        fits = (n_atoms > 0) & (n_atoms <= max_atoms)
-        stats.dropped_too_many_atoms = int((~fits).sum())
-        df = df[fits]
-        records = [r for r, ok in zip(records, fits) if ok]
+    def __init__(self, spectra: pd.DataFrame, cache: SpectralCache, vocab: AdductVocabulary, *, max_atoms: int = 96,
+                 n_quantiles: int = N_QUANTILES, peaks: Peaks = Peaks(), table: Optional[pd.DataFrame] = None,
+                 adjacency: bool = False, n_jobs: int = 1):
+        df = spectra if "neutral_mass" in spectra.columns else prepare(spectra, require_smiles=True)
+        self.cache, self.vocab, self.n_quantiles, self.peaks, self.adjacency, self.max_atoms = cache, vocab, n_quantiles, peaks, adjacency, max_atoms
+        table = structures(df["smiles"].unique(), n_jobs=n_jobs) if table is None else table
+        lookup = {key: r for r in table.to_dict("records") for key in (r.get("input_smiles"), r["smiles"])}
+        drops: Counter = Counter()
+        self.rows, self.records = [], []
+        for row in df.to_dict("records"):
+            if reason := self._reject(row, lookup.get(row["smiles"])):
+                drops[reason] += 1
+            else:
+                self.rows.append(row)
+                self.records.append(lookup[row["smiles"]])
+        self.drops = dict(drops)
+        logger.info("Dataset: kept %d of %d spectra; dropped %s", len(self.rows), len(df), self.drops)
 
-        self._df = df.reset_index(drop=True)
-        self._records = records
-
-        if precompute:
-            unique = pd.DataFrame(
-                {"inchikey": [r["inchikey"] for r in records], "smiles": [r["smiles"] for r in records]}
-            ).drop_duplicates("inchikey")
-            self.cache.precompute_all(unique, n_jobs=n_jobs, show_progress=False)
-            for key, smi in zip(unique["inchikey"], unique["smiles"]):
-                self.cache.get_or_compute_spectrum(smi, key)
-
-        keep: list[int] = []
-        for idx in range(len(self._df)):
-            row = self._df.iloc[idx]
-            record = self._records[idx]
-            mz = parse_peak_list(row["mzs"])
-            intensity = parse_peak_list(row["intensities"])
-            if mz.shape != intensity.shape:
-                stats.dropped_few_peaks += 1
-                continue
-            mz, _ = preprocess_peaks(mz, intensity, _safe_float(row["precursor_mz"]), self.peak_config)
-            if mz.size < self.peak_config.min_peaks:
-                stats.dropped_few_peaks += 1
-                continue
-            if self.cache.get_or_compute(record["smiles"], record["inchikey"]) is None:
-                stats.dropped_cache += 1
-                continue
-            if self.cache.get_or_compute_fingerprint(record["smiles"], record["inchikey"]) is None:
-                stats.dropped_cache += 1
-                continue
-            keep.append(idx)
-        self._df = self._df.iloc[keep].reset_index(drop=True)
-        self._records = [self._records[i] for i in keep]
-        stats.final = len(self._df)
-        self.stats = stats
-        logger.info("CasmiSpectrumDataset: %s", stats)
+    def _reject(self, row: dict, rec: Optional[dict]) -> Optional[str]:
+        if rec is None:
+            return "unparseable smiles"
+        if not np.isfinite(row["neutral_mass"]):
+            return "unsupported adduct"
+        if not 0 < rec["n_heavy_atoms"] <= self.max_atoms:
+            return "atom count"
+        try:
+            mz, _ = self.peaks.from_row(row)
+        except (ValueError, TypeError):
+            return "bad peaks"
+        if mz.size < self.peaks.min_peaks:
+            return "too few peaks"
+        cached = (self.cache.get_or_compute, self.cache.get_or_compute_fingerprint, self.cache.spectrum)
+        return "cache" if any(f(rec["smiles"], rec["inchikey"]) is None for f in cached) else None
 
     def __len__(self) -> int:
-        return len(self._df)
+        return len(self.rows)
 
-    @property
-    def frame(self) -> pd.DataFrame:
-        return self._df
-
-    @property
-    def inchikey14s(self) -> np.ndarray:
-        return np.asarray([r["inchikey14"] for r in self._records], dtype=object)
-
-    @property
-    def molecule_ids(self) -> np.ndarray:
-        return self._df["molecule_id"].astype(str).to_numpy()
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        row = self._df.iloc[idx]
-        record = self._records[idx]
-        smiles = record["smiles"]
-        inchikey = record["inchikey"]
-
-        eigvecs = self.cache.get_or_compute(smiles, inchikey)
-        fingerprint = self.cache.get_or_compute_fingerprint(smiles, inchikey)
-        spectrum = self.cache.get_or_compute_spectrum(smiles, inchikey)
-        assert eigvecs is not None and fingerprint is not None and spectrum is not None
-
-        precursor_mz = _safe_float(row["precursor_mz"])
-        mz, intensity = preprocess_peaks(
-            parse_peak_list(row["mzs"]), parse_peak_list(row["intensities"]), precursor_mz, self.peak_config
+    def __getitem__(self, i: int) -> dict[str, Any]:
+        row, rec = self.rows[i], self.records[i]
+        smiles, key = rec["smiles"], rec["inchikey"]
+        mz, intensity = self.peaks.from_row(row)
+        eigvecs, atoms = self.cache.get_or_compute(smiles, key), chem.symbols(smiles)
+        sample = dict(
+            eigvecs=eigvecs, n_atoms=eigvecs.shape[0], mz=mz, intensity=intensity, precursor_mz=float(row["precursor_mz"]),
+            fingerprint=self.cache.get_or_compute_fingerprint(smiles, key), atom_types=np.asarray(atom_types_to_indices(atoms), dtype=np.int64),
+            atom_symbols=atoms, smiles=smiles, formula=rec["formula"], inchikey=key, inchikey14=rec["inchikey14"],
+            molecule_id=row["molecule_id"], adduct_index=self.vocab.encode(row["adduct"]), collision_energy=row.get("collision_energy"),
+            neutral_mass=float(row["neutral_mass"]), polarity=float(row["polarity"]),
+            spectral_quantiles=quantiles(self.cache.spectrum(smiles, key), self.n_quantiles),
         )
-        symbols = _atom_symbols(smiles)
-        sample: dict[str, Any] = {
-            "eigvecs": eigvecs.astype(np.float32, copy=False),
-            "n_atoms": int(eigvecs.shape[0]),
-            "mz": mz,
-            "intensity": intensity,
-            "precursor_mz": precursor_mz,
-            "fingerprint": fingerprint.astype(np.float32, copy=False)[: self.fingerprint_bits],
-            "atom_types": np.asarray(atom_types_to_indices(symbols), dtype=np.int64),
-            "atom_symbols": symbols,
-            "smiles": smiles,
-            "formula": record["formula"],
-            "inchikey": inchikey,
-            "inchikey14": record["inchikey14"],
-            "molecule_id": str(row["molecule_id"]),
-            "adduct_index": int(self.adduct_vocab.encode(row["adduct"])),
-            "collision_energy": _safe_float(row.get("collision_energy")),
-            "neutral_mass": float(row["neutral_mass"]),
-            "polarity": float(row["polarity"]),
-            "spectral_quantiles": spectral_quantiles(spectrum, self.n_quantiles),
-        }
-        if self.include_adjacency:
-            sample["adjacency"] = kekulized_adjacency(smiles)
+        if self.adjacency:
+            sample["adjacency"] = chem.kekulized_adjacency(smiles)
         return sample
 
 
-def _atom_symbols(smiles: str) -> list[str]:
-    from rdkit import Chem
-
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return []
-    return [atom.GetSymbol() for atom in mol.GetAtoms()]
-
-
-def kekulized_adjacency(smiles: str) -> np.ndarray:
-    """Heavy-atom adjacency with integer bond orders (aromatic bonds kekulised).
-
-    Atom order matches RDKit's parse order of ``smiles``, i.e. the order of
-    the eigenvector rows. Falls back to aromatic order 1.5 rounded down to
-    1 if kekulisation fails.
-    """
-    from rdkit import Chem
-
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return np.zeros((0, 0), dtype=np.float32)
-    n = mol.GetNumAtoms()
-    adjacency = np.zeros((n, n), dtype=np.float32)
-    try:
-        kekulized = Chem.Mol(mol)
-        Chem.Kekulize(kekulized, clearAromaticFlags=True)
-        mol = kekulized
-    except Exception:  # RDKit native exception
-        pass
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        order = bond.GetBondTypeAsDouble()
-        order = 1.0 if order == 1.5 else float(round(order))
-        adjacency[i, j] = adjacency[j, i] = order
-    return adjacency
-
-
-# ----------------------------------------------------------------------
-# Collator
-# ----------------------------------------------------------------------
-
-
 @dataclass
-class CasmiBatch:
-    """A core :class:`TrainingBatch` plus the competition conditioning."""
+class Batch:
+    """A core :class:`TrainingBatch` plus conditioning, quantile targets, metadata and optional adjacencies."""
 
-    batch: TrainingBatch
-    adduct_index: "torch.Tensor"
-    collision_energy: "torch.Tensor"
-    collision_energy_mask: "torch.Tensor"
-    neutral_mass: "torch.Tensor"
-    polarity: "torch.Tensor"
-    spectral_quantiles: "torch.Tensor"
-    metadata: dict[str, list[Any]] = field(default_factory=dict)
+    core: TrainingBatch
+    cond: Conditioning
+    quantiles: torch.Tensor
+    meta: dict[str, list] = field(default_factory=dict)
     adjacencies: Optional[list[np.ndarray]] = None
 
+    def to(self, device) -> "Batch":
+        core = TrainingBatch(**{k: v.to(device) if torch.is_tensor(v) else v for k, v in vars(self.core).items()})
+        return Batch(core, self.cond.to(device), self.quantiles.to(device), self.meta, self.adjacencies)
 
-def _usable(sample: Mapping[str, Any]) -> bool:
-    return int(sample.get("n_atoms", 0)) > 0 and np.asarray(sample["mz"]).size > 0
 
+class Collator:
+    """Wraps the core collator and adds the conditioning, the quantile targets and metadata."""
 
-def make_casmi_collator(
-    *,
-    max_atoms: int,
-    max_peaks: int,
-    k: int,
-    fingerprint_bits: int,
-    n_quantiles: int = DEFAULT_N_QUANTILES,
-    device: str = "cpu",
-) -> Callable[[list[dict[str, Any]]], CasmiBatch]:
-    """Return a collator producing :class:`CasmiBatch` on ``device``."""
-    import torch
+    META = ("molecule_id", "smiles", "inchikey14", "formula", "n_atoms", "neutral_mass")
 
-    core_collate = make_training_batch_collator(
-        max_atoms=max_atoms,
-        max_peaks=max_peaks,
-        k=k,
-        fingerprint_bits=fingerprint_bits,
-        device=device,
-    )
+    def __init__(self, max_atoms: int, max_peaks: int, k: int, fingerprint_bits: int, device: str = "cpu"):
+        self.core = make_training_batch_collator(max_atoms=max_atoms, max_peaks=max_peaks, k=k, fingerprint_bits=fingerprint_bits, device=device)
+        self.device = device
 
-    def collate(samples: list[dict[str, Any]]) -> CasmiBatch:
-        samples = [s for s in samples if _usable(s)]
+    def __call__(self, samples: list[dict]) -> Batch:
+        samples = [s for s in samples if s["n_atoms"] > 0 and np.size(s["mz"]) > 0]
         if not samples:
-            raise ValueError("All samples in the batch were dropped during validation.")
-        batch = core_collate(samples)
-        n = len(samples)
-        ce = np.array([_safe_float(s.get("collision_energy")) for s in samples], dtype=np.float32)
-        ce_mask = np.isfinite(ce)
-        ce = np.where(ce_mask, ce, 0.0).astype(np.float32)
-        quantiles = np.zeros((n, n_quantiles), dtype=np.float32)
-        for i, s in enumerate(samples):
-            q = np.asarray(s["spectral_quantiles"], dtype=np.float32)
-            quantiles[i, : min(n_quantiles, q.size)] = q[:n_quantiles]
-        metadata = {
-            "molecule_id": [str(s.get("molecule_id", "")) for s in samples],
-            "smiles": [s["smiles"] for s in samples],
-            "inchikey14": [s.get("inchikey14") for s in samples],
-            "formula": [s.get("formula", "") for s in samples],
-            "n_atoms": [int(s["n_atoms"]) for s in samples],
-            "neutral_mass": [float(s["neutral_mass"]) for s in samples],
-        }
-        adjacencies = None
-        if "adjacency" in samples[0]:
-            adjacencies = [np.asarray(s["adjacency"], dtype=np.float32) for s in samples]
-        return CasmiBatch(
-            batch=batch,
-            adduct_index=torch.tensor([int(s["adduct_index"]) for s in samples], dtype=torch.long, device=device),
-            collision_energy=torch.from_numpy(ce).to(device),
-            collision_energy_mask=torch.from_numpy(ce_mask).to(device),
-            neutral_mass=torch.tensor([float(s["neutral_mass"]) for s in samples], dtype=torch.float32, device=device),
-            polarity=torch.tensor([float(s["polarity"]) for s in samples], dtype=torch.float32, device=device),
-            spectral_quantiles=torch.from_numpy(quantiles).to(device),
-            metadata=metadata,
-            adjacencies=adjacencies,
-        )
-
-    return collate
-
-
-@dataclass
-class SpectraTensors:
-    """Padded tensors for a set of spectra (one molecule, typically)."""
-
-    mz: "torch.Tensor"
-    intensity: "torch.Tensor"
-    spectrum_mask: "torch.Tensor"
-    precursor_mz: "torch.Tensor"
-    adduct_index: "torch.Tensor"
-    collision_energy: "torch.Tensor"
-    collision_energy_mask: "torch.Tensor"
-    neutral_mass: "torch.Tensor"
-    polarity: "torch.Tensor"
-    row_positions: np.ndarray
-
-    @property
-    def n_spectra(self) -> int:
-        return int(self.mz.shape[0])
-
-
-def spectra_to_tensors(
-    rows: pd.DataFrame,
-    *,
-    adduct_vocab: AdductVocabulary,
-    max_peaks: int,
-    peak_config: Optional[PeakPreprocessConfig] = None,
-    device: str = "cpu",
-) -> Optional[SpectraTensors]:
-    """Preprocess and pad the spectra in ``rows`` (a prepared frame slice).
-
-    Rows with an unsupported adduct or too few peaks are skipped; returns
-    ``None`` when nothing usable remains. ``row_positions`` records which
-    positional rows of ``rows`` survived.
-    """
-    import torch
-
-    peak_config = peak_config or PeakPreprocessConfig()
-    kept_mz: list[np.ndarray] = []
-    kept_int: list[np.ndarray] = []
-    meta: list[tuple[float, int, float, float, float]] = []
-    positions: list[int] = []
-    records = rows.to_dict("records")
-    for position, row in enumerate(records):
-        mass = _safe_float(row.get("neutral_mass"))
-        if not np.isfinite(mass):
-            continue
-        try:
-            mz = parse_peak_list(row["mzs"])
-            intensity = parse_peak_list(row["intensities"])
-        except (ValueError, TypeError):
-            continue
-        if mz.shape != intensity.shape:
-            continue
-        precursor = _safe_float(row.get("precursor_mz"))
-        mz, intensity = preprocess_peaks(mz, intensity, precursor, peak_config)
-        if mz.size < max(1, peak_config.min_peaks):
-            continue
-        kept_mz.append(mz[:max_peaks])
-        kept_int.append(intensity[:max_peaks])
-        meta.append(
-            (
-                precursor,
-                int(adduct_vocab.encode(row.get("adduct"))),
-                _safe_float(row.get("collision_energy")),
-                mass,
-                float(row.get("polarity", 1.0)),
-            )
-        )
-        positions.append(position)
-    if not kept_mz:
-        return None
-    n = len(kept_mz)
-    width = max(int(m.shape[0]) for m in kept_mz)
-    mz_arr = np.zeros((n, width), dtype=np.float32)
-    int_arr = np.zeros((n, width), dtype=np.float32)
-    mask = np.zeros((n, width), dtype=bool)
-    for i, (m, it) in enumerate(zip(kept_mz, kept_int)):
-        mz_arr[i, : m.shape[0]] = m
-        int_arr[i, : it.shape[0]] = it
-        mask[i, : m.shape[0]] = True
-    ce = np.array([m[2] for m in meta], dtype=np.float32)
-    ce_mask = np.isfinite(ce)
-    return SpectraTensors(
-        mz=torch.from_numpy(mz_arr).to(device),
-        intensity=torch.from_numpy(int_arr).to(device),
-        spectrum_mask=torch.from_numpy(mask).to(device),
-        precursor_mz=torch.tensor([m[0] for m in meta], dtype=torch.float32, device=device),
-        adduct_index=torch.tensor([m[1] for m in meta], dtype=torch.long, device=device),
-        collision_energy=torch.from_numpy(np.where(ce_mask, ce, 0.0).astype(np.float32)).to(device),
-        collision_energy_mask=torch.from_numpy(ce_mask).to(device),
-        neutral_mass=torch.tensor([m[3] for m in meta], dtype=torch.float32, device=device),
-        polarity=torch.tensor([m[4] for m in meta], dtype=torch.float32, device=device),
-        row_positions=np.asarray(positions, dtype=np.int64),
-    )
-
-
-__all__ = [
-    "COLUMN_ALIASES",
-    "CasmiBatch",
-    "CasmiSpectrumDataset",
-    "DatasetFilterStats",
-    "PeakPreprocessConfig",
-    "REQUIRED_SPECTRUM_COLUMNS",
-    "STRUCTURE_COLUMNS",
-    "SpectraTensors",
-    "add_derived_columns",
-    "build_structure_table",
-    "group_by_molecule",
-    "kekulized_adjacency",
-    "load_casmi_parquet",
-    "make_casmi_collator",
-    "merge_structure_tables",
-    "normalise_columns",
-    "prepare_spectra_frame",
-    "preprocess_peaks",
-    "spectra_to_tensors",
-    "structure_record",
-]
+            raise ValueError("empty batch after validation")
+        col = lambda key: [s[key] for s in samples]
+        cond = Conditioning.build(col("adduct_index"), col("collision_energy"), col("neutral_mass"), col("polarity"), self.device)
+        q = torch.as_tensor(np.stack(col("spectral_quantiles")), dtype=torch.float32, device=self.device)
+        return Batch(self.core(samples), cond, q, {k: col(k) for k in self.META}, col("adjacency") if "adjacency" in samples[0] else None)

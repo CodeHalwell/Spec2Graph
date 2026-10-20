@@ -1,630 +1,225 @@
-"""Competition conditioning for the core diffusion model, without editing it.
+"""Condition the core diffusion model on adduct, collision energy and neutral mass without editing it.
 
-The competition supplies, per spectrum, an adduct, a collision energy (often
-missing) and a precursor m/z from which the neutral mass follows. The core
-:class:`~spectral_diffusion.Spec2GraphDiffusion` only knows about peaks and
-an optional precursor m/z, so :class:`CasmiModel` wraps it:
-
-1. the core encodes the peaks as usual (``encode_spectrum``);
-2. three *condition tokens* are built, for adduct+polarity, collision energy
-   and neutral mass, and prepended to the encoded peaks;
-3. the concatenation is passed to the core decoder through its existing
-   ``memory`` argument, with the key-padding mask extended to match.
-
-Every core head (fingerprint, atom count, atom types) is reused unchanged
-through the same ``memory``. One new head predicts the Laplacian spectral
-quantiles (:mod:`spec2graph.casmi.spectral`), the permutation-invariant
-descriptor the scorer compares against candidates.
-
-:class:`CasmiTrainer` subclasses the core :class:`DiffusionTrainer` so the
-DDPM schedule, ``q_sample``, ``p_sample`` and the projection/orthonormality
-helpers are shared. Only the loss assembly and the samplers are redefined,
-because they need the conditioned memory.
+Three condition tokens are prepended to the encoded peaks and passed through the core decoder's existing
+``memory`` argument, so every core head is reused unchanged. One new head predicts the Laplacian spectral quantiles.
 """
 
 from __future__ import annotations
 
-import logging
-from dataclasses import asdict, dataclass, field
+import math
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Iterator, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from spec2graph.casmi.adducts import AdductVocabulary
-from spec2graph.casmi.data import CasmiBatch
-from spec2graph.casmi.spectral import DEFAULT_N_QUANTILES
+from spec2graph.casmi.data import Batch, Conditioning, Spectra
+from spec2graph.casmi.spectral import N_QUANTILES
 from spec2graph.eval.ddim import _make_timestep_schedule
-from spectral_diffusion import (
-    DiffusionTrainer,
-    FourierMzEmbedding,
-    Spec2GraphDiffusion,
-    Spec2GraphDiffusionConfig,
-    TrainerConfig,
-)
+from spectral_diffusion import DiffusionTrainer, FourierMzEmbedding, Spec2GraphDiffusion, Spec2GraphDiffusionConfig, TrainerConfig
 
-logger = logging.getLogger(__name__)
-
-N_CONDITION_TOKENS: int = 3
-# Ridge added to V^T V in the rank-safe projector. Negligible for orthonormal
-# columns (scales the projector by 1/(1+ridge)); keeps gradients finite when a
-# molecule has fewer heavy atoms than k and the eigenvector matrix is rank
-# deficient, where the QR-based projector's backward pass returns NaN.
-PROJECTION_RIDGE: float = 1e-4
+N_TOKENS = 3
+RIDGE = 1e-4
+FORMAT = "spec2graph-casmi-v1"
 
 
 @dataclass
 class CasmiModelConfig:
-    """Hyper-parameters of the conditioning wrapper."""
-
     n_adducts: int
-    n_quantiles: int = DEFAULT_N_QUANTILES
-    # Fourier scale for collision energy (eV) and neutral mass (Da).
+    n_quantiles: int = N_QUANTILES
     collision_energy_max: float = 200.0
     mass_max: float = 2000.0
-    enable_quantile_head: bool = True
-
-
-@dataclass
-class Conditioning:
-    """Per-spectrum conditioning tensors, all shaped ``(batch,)``."""
-
-    adduct_index: torch.Tensor
-    collision_energy: torch.Tensor
-    collision_energy_mask: torch.Tensor
-    neutral_mass: torch.Tensor
-    polarity: torch.Tensor
-
-    @classmethod
-    def from_batch(cls, batch: CasmiBatch) -> "Conditioning":
-        return cls(
-            adduct_index=batch.adduct_index,
-            collision_energy=batch.collision_energy,
-            collision_energy_mask=batch.collision_energy_mask,
-            neutral_mass=batch.neutral_mass,
-            polarity=batch.polarity,
-        )
-
-    @classmethod
-    def build(
-        cls,
-        adduct_index: list[int] | torch.Tensor,
-        collision_energy: list[Optional[float]] | torch.Tensor,
-        neutral_mass: list[float] | torch.Tensor,
-        polarity: list[float] | torch.Tensor,
-        device: str | torch.device = "cpu",
-    ) -> "Conditioning":
-        """Build from Python lists; ``None``/NaN collision energies are masked."""
-        adduct = torch.as_tensor(adduct_index, dtype=torch.long, device=device)
-        ce_values = [float("nan") if v is None else float(v) for v in collision_energy] if not isinstance(
-            collision_energy, torch.Tensor
-        ) else collision_energy
-        ce = torch.as_tensor(ce_values, dtype=torch.float32, device=device)
-        mask = torch.isfinite(ce)
-        ce = torch.where(mask, ce, torch.zeros_like(ce))
-        return cls(
-            adduct_index=adduct,
-            collision_energy=ce,
-            collision_energy_mask=mask,
-            neutral_mass=torch.as_tensor(neutral_mass, dtype=torch.float32, device=device),
-            polarity=torch.as_tensor(polarity, dtype=torch.float32, device=device),
-        )
-
-    @property
-    def batch_size(self) -> int:
-        return int(self.adduct_index.shape[0])
-
-    def to(self, device: str | torch.device) -> "Conditioning":
-        return Conditioning(*(t.to(device) for t in self._tensors()))
-
-    def _tensors(self) -> tuple[torch.Tensor, ...]:
-        return (
-            self.adduct_index,
-            self.collision_energy,
-            self.collision_energy_mask,
-            self.neutral_mass,
-            self.polarity,
-        )
-
-    def repeat_interleave(self, repeats: int) -> "Conditioning":
-        """Tile every row ``repeats`` times (for several samples per spectrum)."""
-        return Conditioning(*(t.repeat_interleave(repeats, dim=0) for t in self._tensors()))
-
-    def select(self, indices: torch.Tensor | list[int]) -> "Conditioning":
-        idx = torch.as_tensor(indices, dtype=torch.long, device=self.adduct_index.device)
-        return Conditioning(*(t.index_select(0, idx) for t in self._tensors()))
-
-    def validate(self) -> None:
-        n = self.batch_size
-        for name, tensor in zip(
-            ("adduct_index", "collision_energy", "collision_energy_mask", "neutral_mass", "polarity"),
-            self._tensors(),
-        ):
-            if tensor.dim() != 1 or tensor.shape[0] != n:
-                raise ValueError(f"Conditioning.{name} must have shape ({n},); got {tuple(tensor.shape)}.")
-        if self.collision_energy_mask.dtype != torch.bool:
-            raise ValueError("collision_energy_mask must be boolean.")
 
 
 class CasmiModel(nn.Module):
-    """Core diffusion model plus competition conditioning and a quantile head."""
+    """Core model + adduct/polarity, collision-energy and neutral-mass tokens + a spectral-quantile head."""
 
-    def __init__(self, core: Spec2GraphDiffusion, config: CasmiModelConfig) -> None:
+    def __init__(self, core: Spec2GraphDiffusion, config: CasmiModelConfig):
         super().__init__()
-        if config.n_adducts < 1:
-            raise ValueError("n_adducts must be >= 1 (index 0 is the unknown adduct).")
-        self.core = core
-        self.config = config
-        d_model = core.d_model
+        d = core.d_model
+        self.core, self.config = core, config
+        self.adduct, self.polarity = nn.Embedding(config.n_adducts, d), nn.Embedding(2, d)
+        self.energy, self.mass = FourierMzEmbedding(d, max_mz=config.collision_energy_max), FourierMzEmbedding(d, max_mz=config.mass_max)
+        self.energy_missing = nn.Parameter(torch.randn(d) * 0.02)
+        self.token_type = nn.Parameter(torch.randn(N_TOKENS, d) * 0.02)
+        self.norm = nn.LayerNorm(d)
+        self.quantile_head = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Linear(d, config.n_quantiles))
 
-        self.adduct_embedding = nn.Embedding(config.n_adducts, d_model)
-        self.polarity_embedding = nn.Embedding(2, d_model)
-        self.collision_energy_embedding = FourierMzEmbedding(d_model, max_mz=config.collision_energy_max)
-        self.collision_energy_missing = nn.Parameter(torch.zeros(d_model))
-        self.mass_embedding = FourierMzEmbedding(d_model, max_mz=config.mass_max)
-        self.token_type = nn.Parameter(torch.zeros(N_CONDITION_TOKENS, d_model))
-        self.condition_norm = nn.LayerNorm(d_model)
-        nn.init.normal_(self.token_type, std=0.02)
-        nn.init.normal_(self.collision_energy_missing, std=0.02)
+    def tokens(self, cond: Conditioning) -> torch.Tensor:
+        adduct = self.adduct(cond.adduct_index) + self.polarity((cond.polarity > 0).long())
+        energy = self.energy(cond.collision_energy.clamp(min=0).unsqueeze(-1)).squeeze(1)
+        energy = torch.where(cond.collision_energy_mask.unsqueeze(-1), energy, self.energy_missing.expand_as(energy))
+        mass = self.mass(cond.neutral_mass.clamp(min=0).unsqueeze(-1)).squeeze(1)
+        return self.norm(torch.stack([adduct, energy, mass], 1) + self.token_type)
 
-        if config.enable_quantile_head:
-            self.quantile_head: Optional[nn.Module] = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.ReLU(),
-                nn.Linear(d_model, config.n_quantiles),
-            )
-        else:
-            self.quantile_head = None
+    def encode(self, mz, intensity, mask, precursor_mz, cond: Conditioning) -> tuple[torch.Tensor, torch.Tensor]:
+        """Conditioned memory ``(B, 3 + P, d)`` and its validity mask."""
+        encoded = self.core.encode_spectrum(mz, intensity, mask, precursor_mz)
+        if mask is None:
+            mask = torch.ones(encoded.shape[:2], dtype=torch.bool, device=encoded.device)
+        ones = torch.ones(encoded.shape[0], N_TOKENS, dtype=torch.bool, device=encoded.device)
+        return torch.cat([self.tokens(cond), encoded], 1), torch.cat([ones, mask], 1)
 
-    # ------------------------------------------------------------------
-    # Convenience accessors mirroring the core
-    # ------------------------------------------------------------------
+    def denoise(self, x_t, t, atom_mask, memory, memory_mask, with_atom_types: bool = False):
+        """Core decoder pass; it ignores mz/intensity once ``memory`` is given and takes the memory mask as ``spectrum_mask``."""
+        fn = self.core.forward_with_atom_types if with_atom_types else self.core.forward
+        return fn(x_t, t, None, None, atom_mask, memory_mask, None, memory=memory)
 
-    @property
-    def k(self) -> int:
-        return self.core.k
-
-    @property
-    def max_atoms(self) -> int:
-        return self.core.max_atoms
-
-    @property
-    def d_model(self) -> int:
-        return self.core.d_model
-
-    # ------------------------------------------------------------------
-    # Conditioning
-    # ------------------------------------------------------------------
-
-    def condition_tokens(self, cond: Conditioning) -> torch.Tensor:
-        """``(batch, N_CONDITION_TOKENS, d_model)`` tokens for the memory."""
-        cond.validate()
-        polarity_index = (cond.polarity > 0).long()
-        adduct = self.adduct_embedding(cond.adduct_index) + self.polarity_embedding(polarity_index)
-
-        ce_input = cond.collision_energy.clamp(min=0.0).unsqueeze(-1)  # (batch, 1)
-        ce = self.collision_energy_embedding(ce_input).squeeze(1)
-        missing = self.collision_energy_missing.unsqueeze(0).expand_as(ce)
-        ce = torch.where(cond.collision_energy_mask.unsqueeze(-1), ce, missing)
-
-        mass = self.mass_embedding(cond.neutral_mass.clamp(min=0.0).unsqueeze(-1)).squeeze(1)
-
-        tokens = torch.stack([adduct, ce, mass], dim=1) + self.token_type.unsqueeze(0)
-        return self.condition_norm(tokens)
-
-    def encode(
-        self,
-        mz: torch.Tensor,
-        intensity: torch.Tensor,
-        spectrum_mask: Optional[torch.Tensor],
-        precursor_mz: Optional[torch.Tensor],
-        cond: Conditioning,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Conditioned memory ``(batch, 3 + n_peaks, d)`` and its validity mask."""
-        encoded = self.core.encode_spectrum(mz, intensity, spectrum_mask, precursor_mz)
-        tokens = self.condition_tokens(cond)
-        if tokens.shape[0] != encoded.shape[0]:
-            raise ValueError(
-                f"Conditioning batch ({tokens.shape[0]}) does not match spectra batch ({encoded.shape[0]})."
-            )
-        memory = torch.cat([tokens, encoded], dim=1)
-        if spectrum_mask is None:
-            spectrum_mask = torch.ones(encoded.shape[:2], dtype=torch.bool, device=encoded.device)
-        token_mask = torch.ones(
-            (encoded.shape[0], N_CONDITION_TOKENS), dtype=torch.bool, device=encoded.device
-        )
-        return memory, torch.cat([token_mask, spectrum_mask], dim=1)
-
-    # ------------------------------------------------------------------
-    # Decoder passes through the core, with the conditioned memory
-    # ------------------------------------------------------------------
-
-    def denoise(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        atom_mask: Optional[torch.Tensor],
-        memory: torch.Tensor,
-        memory_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        # The core ignores mz/intensity once ``memory`` is given and uses the
-        # ``spectrum_mask`` argument as the memory key-padding mask.
-        return self.core(x_t, t, None, None, atom_mask, memory_mask, None, memory=memory)
-
-    def denoise_with_atom_types(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        atom_mask: Optional[torch.Tensor],
-        memory: torch.Tensor,
-        memory_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.core.forward_with_atom_types(
-            x_t, t, None, None, atom_mask, memory_mask, None, memory=memory
-        )
-
-    def pooled(self, memory: torch.Tensor, memory_mask: torch.Tensor) -> torch.Tensor:
+    def pooled(self, memory, memory_mask):
         return self.core._pool_spectrum(memory, memory_mask)
 
-    def predict_fingerprint_logits(self, memory: torch.Tensor, memory_mask: torch.Tensor) -> torch.Tensor:
-        if self.core.fingerprint_head is None:
-            raise ValueError("The core model has no fingerprint head (fingerprint_dim=0).")
+    def fingerprint_logits(self, memory, memory_mask):
         return self.core.fingerprint_head(self.pooled(memory, memory_mask))
 
-    def predict_atom_count(self, memory: torch.Tensor, memory_mask: torch.Tensor) -> torch.Tensor:
-        if self.core.atom_count_head is None:
-            raise ValueError("The core model has no atom-count head.")
+    def atom_count(self, memory, memory_mask):
         return self.core.atom_count_head(self.pooled(memory, memory_mask)).squeeze(-1)
 
-    def predict_quantiles(self, memory: torch.Tensor, memory_mask: torch.Tensor, *, sort: bool = False) -> torch.Tensor:
-        if self.quantile_head is None:
-            raise ValueError("Quantile head disabled; set enable_quantile_head=True.")
-        out = self.quantile_head(self.pooled(memory, memory_mask))
-        return torch.sort(out, dim=-1).values if sort else out
-
-
-# ----------------------------------------------------------------------
-# Trainer
-# ----------------------------------------------------------------------
+    def quantiles(self, memory, memory_mask):
+        return self.quantile_head(self.pooled(memory, memory_mask))
 
 
 @dataclass
 class CasmiTrainerConfig(TrainerConfig):
     quantile_loss_weight: float = 1.0
+    # Proxy mode: train the encoder and the heads only, skipping the denoiser (minutes instead of hours).
+    heads_only: bool = False
 
 
 class CasmiTrainer(DiffusionTrainer):
-    """:class:`DiffusionTrainer` whose loss and samplers use the conditioned memory.
+    """Core trainer with the conditioned memory. ``self.model`` is the core, ``self.wrapper`` the :class:`CasmiModel`."""
 
-    ``self.model`` is the *core* model (so every inherited helper keeps
-    working); ``self.casmi_model`` is the wrapper. Build the optimiser over
-    ``casmi_model.parameters()`` so the conditioning layers train too.
-    """
-
-    def __init__(
-        self,
-        model: CasmiModel,
-        config: Optional[CasmiTrainerConfig] = None,
-        device: str | torch.device = "cpu",
-    ) -> None:
-        config = config or CasmiTrainerConfig()
-        super().__init__(model=model.core, config=config, device=device)
-        self.casmi_model = model
-        self.quantile_loss_weight = float(getattr(config, "quantile_loss_weight", 0.0))
-
-    # ------------------------------------------------------------------
-    # Loss
-    # ------------------------------------------------------------------
+    def __init__(self, model: CasmiModel, config: Optional[CasmiTrainerConfig] = None, device: str | torch.device = "cpu"):
+        self.config: CasmiTrainerConfig = config or CasmiTrainerConfig()
+        super().__init__(model.core, self.config, device)
+        self.wrapper = model.to(device)
 
     @staticmethod
-    def projection_from_embeddings(
-        embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """Rank-safe subspace projector ``P = V (VᵀV + εI)⁻¹ Vᵀ``.
-
-        Identical (up to ``1/(1+ε)``) to the core's QR projector when ``V``
-        has full column rank, but differentiable when it does not: the core's
-        ``torch.linalg.qr`` backward returns NaN for rank-deficient input,
-        which happens for every molecule with fewer heavy atoms than ``k``.
-        Masked atoms are zeroed before and after, as in the core.
-        """
-        masked = embeddings if mask is None else embeddings * mask.unsqueeze(-1).to(embeddings.dtype)
-        k = masked.shape[-1]
-        eye = torch.eye(k, device=embeddings.device, dtype=embeddings.dtype)
-        gram = masked.transpose(-1, -2) @ masked + PROJECTION_RIDGE * eye
-        inverse = torch.linalg.solve(gram, eye.expand(masked.shape[0], k, k))
-        proj = masked @ inverse @ masked.transpose(-1, -2)
+    def projection_from_embeddings(embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Rank-safe ``V (VᵀV + εI)⁻¹ Vᵀ``: the core's QR projector at full rank, finite gradients when rank deficient."""
+        v = embeddings if mask is None else embeddings * mask.unsqueeze(-1).to(embeddings.dtype)
+        eye = torch.eye(v.shape[-1], device=v.device, dtype=v.dtype)
+        proj = v @ torch.linalg.solve(v.transpose(-1, -2) @ v + RIDGE * eye, eye.expand(v.shape[0], -1, -1)) @ v.transpose(-1, -2)
         if mask is not None:
             proj = proj * (mask.unsqueeze(-1) & mask.unsqueeze(-2)).to(proj.dtype)
         return 0.5 * (proj + proj.transpose(-1, -2))
 
-    def compute_loss(  # type: ignore[override]
-        self,
-        batch: CasmiBatch,
-        return_components: bool = False,
-    ):
-        tb = batch.batch
-        cond = Conditioning.from_batch(batch)
-        x_0, atom_mask = tb.x_0, tb.atom_mask
-        batch_size = x_0.shape[0]
+    def compute_loss(self, batch: Batch, return_components: bool = False):  # type: ignore[override]
+        tb, cfg, model = batch.core, self.config, self.wrapper
+        memory, mask = model.encode(tb.mz, tb.intensity, tb.spectrum_mask, tb.precursor_mz, batch.cond)
+        parts = {} if cfg.heads_only else self._diffusion_losses(tb, memory, mask)
+        if cfg.fingerprint_loss_weight and tb.fingerprint_targets is not None and self.model.fingerprint_head is not None:
+            parts["fingerprint"] = F.binary_cross_entropy_with_logits(model.fingerprint_logits(memory, mask), tb.fingerprint_targets)
+        if cfg.atom_count_loss_weight and tb.atom_count_targets is not None and self.model.atom_count_head is not None:
+            parts["atom_count"] = F.mse_loss(model.atom_count(memory, mask), tb.atom_count_targets.float())
+        if cfg.quantile_loss_weight:
+            parts["quantile"] = F.mse_loss(model.quantiles(memory, mask), batch.quantiles)
+        weights = dict(noise=1.0, projection=cfg.projection_loss_weight, orthonormality=cfg.orthonormality_loss_weight,
+                       atom_type=cfg.atom_type_loss_weight, fingerprint=cfg.fingerprint_loss_weight,
+                       atom_count=cfg.atom_count_loss_weight, quantile=cfg.quantile_loss_weight)
+        loss = sum(weights[k] * v for k, v in parts.items())
+        return (loss, {k: v.detach() for k, v in parts.items()}) if return_components else loss
 
-        memory, memory_mask = self.casmi_model.encode(tb.mz, tb.intensity, tb.spectrum_mask, tb.precursor_mz, cond)
+    def _diffusion_losses(self, tb, memory, mask) -> dict[str, torch.Tensor]:
+        cfg, x_0, atom_mask = self.config, tb.x_0, tb.atom_mask
+        t = torch.randint(0, self.n_timesteps, (x_0.shape[0],), device=self.device)
+        x_t, noise = self.q_sample(x_0, t)
+        with_types = bool(cfg.atom_type_loss_weight) and tb.atom_type_targets is not None and self.model.atom_type_head is not None
+        out = self.wrapper.denoise(x_t, t, atom_mask, memory, mask, with_atom_types=with_types)
+        eps, logits = out if with_types else (out, None)
+        parts = {"noise": self._masked_mse(eps, noise, None if atom_mask is None else atom_mask.unsqueeze(-1))}
+        if cfg.projection_loss_weight or cfg.orthonormality_loss_weight:
+            view = lambda s: s[t].view(-1, 1, 1)
+            x_0_pred = self._reconstruct_x0(x_t, eps, view(self.sqrt_alpha_cumprod_clamped), view(self.sqrt_one_minus_alpha_cumprod_clamped))
+            if cfg.projection_loss_weight:
+                pair = None if atom_mask is None else atom_mask.unsqueeze(-1) * atom_mask.unsqueeze(-2)
+                parts["projection"] = self._masked_mse(self.projection_from_embeddings(x_0_pred, atom_mask), self.projection_from_embeddings(x_0, atom_mask), pair)
+            if cfg.orthonormality_loss_weight:
+                parts["orthonormality"] = self._orthonormality_loss(x_0_pred, atom_mask)
+        if logits is not None:
+            parts["atom_type"] = F.cross_entropy(logits.flatten(0, 1), tb.atom_type_targets.flatten(), ignore_index=-100)
+        return parts
 
-        t = torch.randint(0, self.n_timesteps, (batch_size,), device=self.device)
-        noise = torch.randn_like(x_0)
-        x_t, _ = self.q_sample(x_0, t, noise)
-
-        atom_type_active = (
-            self.atom_type_loss_weight > 0
-            and tb.atom_type_targets is not None
-            and self.model.atom_type_head is not None
-        )
-        atom_type_logits = None
-        if atom_type_active:
-            predicted_noise, atom_type_logits = self.casmi_model.denoise_with_atom_types(
-                x_t, t, atom_mask, memory, memory_mask
-            )
-        else:
-            predicted_noise = self.casmi_model.denoise(x_t, t, atom_mask, memory, memory_mask)
-
-        noise_loss = self._masked_mse(
-            predicted_noise, noise, mask=atom_mask.unsqueeze(-1) if atom_mask is not None else None
-        )
-        loss = noise_loss
-        zero = torch.tensor(0.0, device=self.device)
-        components = {
-            "noise": noise_loss.detach(),
-            "projection": zero,
-            "orthonormality": zero,
-            "fingerprint": zero,
-            "atom_count": zero,
-            "quantile": zero,
-            "atom_type": zero,
-        }
-
-        if self.projection_loss_weight > 0 or self.orthonormality_loss_weight > 0:
-            sqrt_alpha = self.sqrt_alpha_cumprod_clamped[t].view(batch_size, 1, 1)
-            sqrt_one_minus = self.sqrt_one_minus_alpha_cumprod_clamped[t].view(batch_size, 1, 1)
-            x_0_pred = self._reconstruct_x0(x_t, predicted_noise, sqrt_alpha, sqrt_one_minus)
-            if self.projection_loss_weight > 0:
-                proj_pred = self.projection_from_embeddings(x_0_pred, atom_mask)
-                proj_target = self.projection_from_embeddings(x_0, atom_mask)
-                mask_matrix = None if atom_mask is None else atom_mask.unsqueeze(-1) * atom_mask.unsqueeze(-2)
-                proj_loss = self._masked_mse(proj_pred, proj_target, mask=mask_matrix)
-                loss = loss + self.projection_loss_weight * proj_loss
-                components["projection"] = proj_loss.detach()
-            if self.orthonormality_loss_weight > 0:
-                ortho_loss = self._orthonormality_loss(x_0_pred, atom_mask)
-                loss = loss + self.orthonormality_loss_weight * ortho_loss
-                components["orthonormality"] = ortho_loss.detach()
-
-        if self.fingerprint_loss_weight > 0 and tb.fingerprint_targets is not None and self.model.fingerprint_head is not None:
-            fp_logits = self.casmi_model.predict_fingerprint_logits(memory, memory_mask)
-            fp_loss = F.binary_cross_entropy_with_logits(fp_logits, tb.fingerprint_targets)
-            loss = loss + self.fingerprint_loss_weight * fp_loss
-            components["fingerprint"] = fp_loss.detach()
-
-        if self.atom_count_loss_weight > 0 and tb.atom_count_targets is not None and self.model.atom_count_head is not None:
-            count_pred = self.casmi_model.predict_atom_count(memory, memory_mask)
-            count_loss = F.mse_loss(count_pred, tb.atom_count_targets.float())
-            loss = loss + self.atom_count_loss_weight * count_loss
-            components["atom_count"] = count_loss.detach()
-
-        if self.quantile_loss_weight > 0 and self.casmi_model.quantile_head is not None:
-            q_pred = self.casmi_model.predict_quantiles(memory, memory_mask)
-            q_loss = F.mse_loss(q_pred, batch.spectral_quantiles)
-            loss = loss + self.quantile_loss_weight * q_loss
-            components["quantile"] = q_loss.detach()
-
-        if atom_type_active and atom_type_logits is not None:
-            at_loss = F.cross_entropy(
-                atom_type_logits.reshape(-1, atom_type_logits.shape[-1]),
-                tb.atom_type_targets.reshape(-1),
-                ignore_index=-100,
-            )
-            loss = loss + self.atom_type_loss_weight * at_loss
-            components["atom_type"] = at_loss.detach()
-
-        if return_components:
-            return loss, components
-        return loss
-
-    def train_step(  # type: ignore[override]
-        self,
-        optimizer: torch.optim.Optimizer,
-        batch: CasmiBatch,
-        return_components: bool = False,
-        grad_clip: Optional[float] = None,
-    ):
-        self.casmi_model.train()
+    def train_step(self, optimizer, batch: Batch, return_components: bool = False, grad_clip: Optional[float] = None):  # type: ignore[override]
+        self.wrapper.train()
         optimizer.zero_grad()
-        if return_components:
-            loss, components = self.compute_loss(batch, return_components=True)
-        else:
-            loss, components = self.compute_loss(batch), None
+        out = self.compute_loss(batch, return_components)
+        loss = out[0] if return_components else out
         loss.backward()
         if grad_clip:
-            torch.nn.utils.clip_grad_norm_(self.casmi_model.parameters(), grad_clip)
+            torch.nn.utils.clip_grad_norm_(self.wrapper.parameters(), grad_clip)
         optimizer.step()
-        if return_components:
-            return loss.item(), {k: float(v.item()) for k, v in components.items()}
-        return loss.item()
-
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
+        return (loss.item(), {k: v.item() for k, v in out[1].items()}) if return_components else loss.item()
 
     @torch.no_grad()
-    def encode(
-        self,
-        mz: torch.Tensor,
-        intensity: torch.Tensor,
-        spectrum_mask: Optional[torch.Tensor],
-        precursor_mz: Optional[torch.Tensor],
-        cond: Conditioning,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        self.casmi_model.eval()
-        return self.casmi_model.encode(mz, intensity, spectrum_mask, precursor_mz, cond)
-
-    @torch.no_grad()
-    def predict_heads(
-        self,
-        mz: torch.Tensor,
-        intensity: torch.Tensor,
-        spectrum_mask: Optional[torch.Tensor],
-        precursor_mz: Optional[torch.Tensor],
-        cond: Conditioning,
-    ) -> dict[str, torch.Tensor]:
-        """Fingerprint probabilities, sorted quantiles, atom count, and the memory."""
-        memory, memory_mask = self.encode(mz, intensity, spectrum_mask, precursor_mz, cond)
-        out: dict[str, torch.Tensor] = {"memory": memory, "memory_mask": memory_mask}
+    def heads(self, spectra: Spectra) -> dict[str, torch.Tensor]:
+        """Conditioned memory plus per-spectrum fingerprint probabilities, sorted quantiles and atom counts."""
+        self.wrapper.eval()
+        memory, mask = self.wrapper.encode(spectra.mz, spectra.intensity, spectra.mask, spectra.precursor_mz, spectra.cond)
+        out = dict(memory=memory, memory_mask=mask, quantiles=self.wrapper.quantiles(memory, mask).sort(-1).values.clamp(0, 2))
         if self.model.fingerprint_head is not None:
-            out["fingerprint_prob"] = torch.sigmoid(self.casmi_model.predict_fingerprint_logits(memory, memory_mask))
-        if self.casmi_model.quantile_head is not None:
-            out["quantiles"] = self.casmi_model.predict_quantiles(memory, memory_mask, sort=True).clamp(0.0, 2.0)
+            out["fingerprint_prob"] = torch.sigmoid(self.wrapper.fingerprint_logits(memory, mask))
         if self.model.atom_count_head is not None:
-            out["atom_count"] = self.casmi_model.predict_atom_count(memory, memory_mask)
+            out["atom_count"] = self.wrapper.atom_count(memory, mask)
         return out
 
     @torch.no_grad()
-    def sample(  # type: ignore[override]
-        self,
-        memory: torch.Tensor,
-        memory_mask: torch.Tensor,
-        *,
-        n_atoms: int,
-        atom_mask: Optional[torch.Tensor] = None,
-        sampler: str = "ddim",
-        n_steps: int = 50,
-        eta: float = 0.0,
-        x_t: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Reverse diffusion from a precomputed conditioned memory.
-
-        Returns ``(batch, n_atoms, k)`` eigenvector samples. Tile ``memory``
-        (``repeat_interleave``) to draw several samples per spectrum.
-        """
-        self.casmi_model.eval()
-        batch_size = memory.shape[0]
-        if n_atoms < 1 or n_atoms > self.model.max_atoms:
-            raise ValueError(f"n_atoms must be in [1, {self.model.max_atoms}]; got {n_atoms}.")
-        if x_t is None:
-            x_t = torch.randn(batch_size, n_atoms, self.model.k, device=self.device)
+    def sample(self, memory, memory_mask, n_atoms: int, atom_mask=None, sampler: str = "ddim", n_steps: int = 50, eta: float = 0.0):  # type: ignore[override]
+        """Reverse diffusion from a conditioned memory: ``(B, n_atoms, k)`` eigenvectors (DDPM or DDIM)."""
+        self.wrapper.eval()
+        if not 1 <= n_atoms <= self.model.max_atoms:
+            raise ValueError(f"n_atoms must be in [1, {self.model.max_atoms}]")
+        x = torch.randn(memory.shape[0], n_atoms, self.model.k, device=self.device)
         if sampler == "ddpm":
             for t in reversed(range(self.n_timesteps)):
-                x_t = self.p_sample(x_t, t, None, None, atom_mask, memory_mask, None, memory=memory)
-            return x_t
+                x = self.p_sample(x, t, None, None, atom_mask, memory_mask, None, memory=memory)
+            return x
         if sampler != "ddim":
-            raise ValueError(f"Unknown sampler {sampler!r}; expected 'ddpm' or 'ddim'.")
-        if n_steps > self.n_timesteps:
-            raise ValueError(f"n_steps={n_steps} exceeds n_timesteps={self.n_timesteps}.")
+            raise ValueError(f"unknown sampler {sampler!r}")
         schedule = _make_timestep_schedule(n_steps, self.n_timesteps)
-        alpha_cumprod = self.alpha_cumprod
-        for i, t in enumerate(schedule):
-            t_next = schedule[i + 1] if i + 1 < len(schedule) else -1
-            t_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
-            eps = self.casmi_model.denoise(x_t, t_tensor, atom_mask, memory, memory_mask)
-            a_t = alpha_cumprod[t]
-            a_next = alpha_cumprod[t_next] if t_next >= 0 else torch.tensor(1.0, device=self.device, dtype=a_t.dtype)
-            x0_pred = (x_t - torch.sqrt(1.0 - a_t) * eps) / torch.sqrt(a_t).clamp_min(1e-8)
-            if eta > 0.0 and t_next >= 0:
-                sigma = eta * torch.sqrt(
-                    (1.0 - a_next) / (1.0 - a_t).clamp_min(1e-8) * (1.0 - a_t / a_next.clamp_min(1e-8))
-                )
-            else:
-                sigma = torch.zeros((), device=self.device, dtype=a_t.dtype)
-            direction = torch.sqrt((1.0 - a_next - sigma**2).clamp_min(0.0)) * eps
-            x_t = torch.sqrt(a_next) * x0_pred + direction
-            if eta > 0.0 and t_next >= 0:
-                x_t = x_t + sigma * torch.randn_like(x_t)
-        return x_t
+        for t, t_next in zip(schedule, schedule[1:] + [-1]):
+            a_t = self.alpha_cumprod[t]
+            a_next = self.alpha_cumprod[t_next] if t_next >= 0 else torch.ones((), device=self.device)
+            eps = self.wrapper.denoise(x, torch.full((x.shape[0],), t, device=self.device, dtype=torch.long), atom_mask, memory, memory_mask)
+            x0 = (x - (1 - a_t).sqrt() * eps) / a_t.sqrt().clamp_min(1e-8)
+            sigma = eta * ((1 - a_next) / (1 - a_t).clamp_min(1e-8) * (1 - a_t / a_next.clamp_min(1e-8))).sqrt() if eta and t_next >= 0 else 0.0
+            x = a_next.sqrt() * x0 + (1 - a_next - sigma**2).clamp_min(0).sqrt() * eps
+            if eta and t_next >= 0:
+                x = x + sigma * torch.randn_like(x)
+        return x
 
     @torch.no_grad()
-    def atom_type_logits(
-        self,
-        eigvecs: torch.Tensor,
-        atom_mask: Optional[torch.Tensor],
-        memory: torch.Tensor,
-        memory_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Element logits ``(batch, n_atoms, n_element_types)`` for clean eigenvectors."""
-        self.casmi_model.eval()
-        t_zero = torch.zeros(eigvecs.shape[0], dtype=torch.long, device=self.device)
-        _, logits = self.casmi_model.denoise_with_atom_types(eigvecs, t_zero, atom_mask, memory, memory_mask)
-        return logits
+    def draw(self, memory, memory_mask, n_atoms: int, n_draws: int, batch: int = 256, **sample_kw) -> Iterator[tuple]:
+        """Yield ``(eigvecs, memory, mask)`` chunks, spreading ``n_draws`` round-robin over the spectra in ``memory``."""
+        for start in range(0, n_draws, batch):
+            ids = torch.arange(start, min(start + batch, n_draws), device=memory.device) % memory.shape[0]
+            yield self.sample(memory[ids], memory_mask[ids], n_atoms, **sample_kw), memory[ids], memory_mask[ids]
+
+    @torch.no_grad()
+    def atom_type_logprobs(self, eigvecs, memory, memory_mask) -> torch.Tensor:
+        """Element log-probabilities ``(B, N, E)`` for clean eigenvectors; uniform when the head is absent."""
+        if self.model.atom_type_head is None:
+            e = self.model.n_element_types
+            return torch.full((*eigvecs.shape[:2], e), -math.log(e), device=eigvecs.device)
+        t = torch.zeros(eigvecs.shape[0], dtype=torch.long, device=self.device)
+        return F.log_softmax(self.wrapper.denoise(eigvecs, t, None, memory, memory_mask, with_atom_types=True)[1], -1)
 
 
-# ----------------------------------------------------------------------
-# Checkpoints
-# ----------------------------------------------------------------------
+def save_checkpoint(path, model: CasmiModel, trainer_config: CasmiTrainerConfig, vocab: AdductVocabulary, **extra) -> None:
+    """Everything needed to rebuild the model with ``torch.load(weights_only=True)``."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(dict(format=FORMAT, core_config=vars(model.core.config), casmi_config=asdict(model.config),
+                    trainer_config=asdict(trainer_config), adduct_vocab=vocab.index, state_dict=model.state_dict(), extra=extra), path)
 
 
-@dataclass
-class CheckpointBundle:
-    model: CasmiModel
-    trainer_config: CasmiTrainerConfig
-    adduct_vocab: AdductVocabulary
-    epoch: Optional[int] = None
-    extra: dict[str, Any] = field(default_factory=dict)
-
-
-def save_checkpoint(
-    path: str | Path,
-    model: CasmiModel,
-    trainer_config: CasmiTrainerConfig,
-    adduct_vocab: AdductVocabulary,
-    *,
-    epoch: Optional[int] = None,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    extra: Optional[dict[str, Any]] = None,
-) -> None:
-    """Save everything needed to rebuild the model with ``weights_only=True``."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
-        "format": "spec2graph-casmi-v1",
-        "core_config": dict(model.core.config.__dict__),
-        "casmi_config": asdict(model.config),
-        "trainer_config": asdict(trainer_config),
-        "adduct_vocab": adduct_vocab.to_dict(),
-        "state_dict": model.state_dict(),
-        "epoch": epoch,
-        "extra": dict(extra or {}),
-    }
-    if optimizer is not None:
-        payload["optimizer"] = optimizer.state_dict()
-    torch.save(payload, path)
-
-
-def load_checkpoint(path: str | Path, device: str | torch.device = "cpu") -> CheckpointBundle:
-    """Load a checkpoint written by :func:`save_checkpoint` (``weights_only=True``)."""
-    payload = torch.load(path, map_location=device, weights_only=True)
-    if payload.get("format") != "spec2graph-casmi-v1":
-        raise ValueError(f"Unrecognised checkpoint format {payload.get('format')!r}.")
-    core = Spec2GraphDiffusion(Spec2GraphDiffusionConfig(**payload["core_config"]))
-    model = CasmiModel(core, CasmiModelConfig(**payload["casmi_config"])).to(device)
-    model.load_state_dict(payload["state_dict"])
-    model.eval()
-    return CheckpointBundle(
-        model=model,
-        trainer_config=CasmiTrainerConfig(**payload["trainer_config"]),
-        adduct_vocab=AdductVocabulary.from_dict(payload["adduct_vocab"]),
-        epoch=payload.get("epoch"),
-        extra=dict(payload.get("extra") or {}),
-    )
-
-
-__all__ = [
-    "CasmiModel",
-    "CasmiModelConfig",
-    "CasmiTrainer",
-    "CasmiTrainerConfig",
-    "CheckpointBundle",
-    "Conditioning",
-    "N_CONDITION_TOKENS",
-    "PROJECTION_RIDGE",
-    "load_checkpoint",
-    "save_checkpoint",
-]
+def load_checkpoint(path, device: str | torch.device = "cpu") -> tuple[CasmiModel, CasmiTrainerConfig, AdductVocabulary, dict]:
+    p = torch.load(path, map_location=device, weights_only=True)
+    if p.get("format") != FORMAT:
+        raise ValueError("unrecognised checkpoint format")
+    model = CasmiModel(Spec2GraphDiffusion(Spec2GraphDiffusionConfig(**p["core_config"])), CasmiModelConfig(**p["casmi_config"]))
+    model.load_state_dict(p["state_dict"])
+    vocab = AdductVocabulary()
+    vocab.index = p["adduct_vocab"]
+    return model.to(device).eval(), CasmiTrainerConfig(**p["trainer_config"]), vocab, p["extra"]
