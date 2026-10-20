@@ -5,3 +5,15 @@ __pycache__/
 # Environment
 .DS_Store
 venv/
+
+# Competition data (CC BY-NC 4.0, not redistributable) and derived artefacts
+data/
+assets/
+runs/
+*.parquet
+*.npz
+submission.csv
+.cache/
+
+# Test / tooling caches
+.pytest_cache/
