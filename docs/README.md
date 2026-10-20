@@ -48,6 +48,13 @@ and every stage referenced below points back to specific line numbers there.
 15. [15 — MassSpecGym benchmarking](./15_benchmarking.md)
     The de novo challenge: sampling protocol, metrics, the Hungarian
     assignment, and the reference baselines to beat.
+16. [16 — Theoretical and scientific review](./16_theoretical_scientific_review.md)
+    Identifiability, mathematical consistency, experimental rigour and
+    the evidence still needed.
+17. [17 — Enveda CASMI 2026 competition layer](./17_casmi_competition.md)
+    `spec2graph.casmi`: conditioning on adduct / collision energy / mass,
+    candidate pool, subspace-overlap scoring, ranker, de novo fallback,
+    official metric and submission pipeline.
 
 ## Who this is for
 

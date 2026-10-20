@@ -39,6 +39,18 @@ with degenerate eigenvalues). Instead train on the subspace-invariant projection
     (top-k Tanimoto / MCES, validity), `decode.py` (formula parsing, adjacency
     decode), `ddim.py` (DDIM sampler).
   - `train/sgno_trainer.py` — `SGNOTrainer` for adjacency supervision of the SGNO.
+  - `casmi/` — the Enveda CASMI 2026 competition layer (see `docs/17`).
+    `chem.py` (shared RDKit helpers), `metric.py` (InChIKey14 / MRR@25 +
+    `Submission`), `adducts.py` (neutral mass, `AdductVocabulary`), `data.py`
+    (parquet schema, `Peaks`, `structures`, `Conditioning`, `Spectra`,
+    `Dataset`, `Collator`), `spectral.py` (spectral quantiles,
+    `SpectralCache`), `pool.py` (`CandidatePool`), `conditioning.py`
+    (`CasmiModel` wrapper + `CasmiTrainer`, `heads_only` proxy mode),
+    `scoring.py` (`Scorer`, Sinkhorn-aligned projection overlap),
+    `ranker.py` (`LinearRanker`), `predict.py` (`Predictor`),
+    `validation.py` (novelty classes), `denovo.py` (`BondTypeSGNO`,
+    `DeNovo`, formula enumeration). Keep functions under cognitive
+    complexity 15 (`complexipy spec2graph/casmi`).
   - `scripts/` — CLI entry points (see Commands).
 - **`docs/`** — 15 numbered walkthroughs of each pipeline stage, cross-referenced
   to `spectral_diffusion.py` by `path:line`. Start at `docs/README.md`.
@@ -67,6 +79,16 @@ python -m spec2graph.scripts.prepare_data --cache-dir ~/.cache/spec2graph --k 8 
 python -m spec2graph.scripts.train --cache-dir ~/.cache/spec2graph --output-dir runs/baseline --epochs 20
 python -m spec2graph.scripts.evaluate --checkpoint runs/baseline/epoch_020.pt \
     --sgno-checkpoint runs/baseline/sgno_epoch_020.pt --cache-dir ~/.cache/spec2graph --split test
+```
+
+Competition pipeline (`spec2graph.casmi`; data must come from Kaggle and must
+not be committed):
+
+```bash
+python -m spec2graph.scripts.casmi_prepare  --train-parquet data/train.parquet --cache-dir ~/.cache/spec2graph-casmi --output-dir assets/casmi
+python -m spec2graph.scripts.casmi_train    --train-parquet data/train.parquet --assets-dir assets/casmi --cache-dir ~/.cache/spec2graph-casmi --output-dir runs/casmi --train-bond-sgno
+python -m spec2graph.scripts.casmi_validate --checkpoint runs/casmi/epoch_010.pt --pool assets/casmi/pool.npz --train-parquet data/train.parquet --holdout-keys runs/casmi/holdout_keys.json --fit-ranker runs/casmi/ranker.json --output runs/casmi/validation.json
+python -m spec2graph.scripts.casmi_predict  --checkpoint runs/casmi/epoch_010.pt --pool assets/casmi/pool.npz --ranker runs/casmi/ranker.json --test-parquet data/test.parquet --output submission.csv
 ```
 
 Tests downloading from the internet are gated behind the `network` marker
@@ -99,6 +121,15 @@ Tests downloading from the internet are gated behind the `network` marker
     strict regex before building cache paths — guards against path traversal.
   - Cap string length before `ast.literal_eval` on dataset peak lists, and bound
     chemical-formula length/atom counts in `parse_formula`.
+
+- **Competition layer conventions (`spec2graph/casmi/`):** structures are
+  identified by tautomer-canonical InChIKey14 (`metric.inchikey14`), the
+  same identity the leaderboard uses; the core model is wrapped, never
+  edited (`CasmiModel` prepends condition tokens to the core `memory`);
+  `CasmiTrainer.projection_from_embeddings` is a rank-safe ridge projector
+  because the core QR projector's backward is NaN when a molecule has fewer
+  heavy atoms than `k`; pools and checkpoints load without pickle
+  (`np.load(allow_pickle=False)`, `torch.load(weights_only=True)`).
 
 ## Working notes
 

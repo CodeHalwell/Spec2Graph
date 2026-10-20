@@ -272,6 +272,29 @@ trainer = DiffusionTrainer(
 )
 ```
 
+## Enveda CASMI 2026 competition layer
+
+`spec2graph/casmi/` adapts the model to the Kaggle competition
+[Enveda CASMI 2026 – Molecule ID From Mass Spectra](https://www.kaggle.com/competitions/enveda-CASMI26-molecule-id-mass-spectra)
+without touching the core: the core model is wrapped with adduct /
+collision-energy / neutral-mass conditioning, and the predicted spectral
+subspace is used to **score mass-window candidate structures** (projection
+overlap after Sinkhorn atom alignment, spectral-quantile distance,
+fingerprint likelihood) rather than to generate answers directly. De novo
+generation with a bond-type decoder covers formulas no pool contains. The
+official metric (tautomer-canonical InChIKey14, MRR@25) and the submission
+rules are implemented in `spec2graph.casmi.metric`.
+
+```bash
+python -m spec2graph.scripts.casmi_prepare  --train-parquet data/train.parquet --cache-dir ~/.cache/spec2graph-casmi --output-dir assets/casmi
+python -m spec2graph.scripts.casmi_train    --train-parquet data/train.parquet --assets-dir assets/casmi --cache-dir ~/.cache/spec2graph-casmi --output-dir runs/casmi --train-bond-sgno
+python -m spec2graph.scripts.casmi_validate --checkpoint runs/casmi/epoch_010.pt --pool assets/casmi/pool.npz --train-parquet data/train.parquet --holdout-keys runs/casmi/holdout_keys.json --fit-ranker runs/casmi/ranker.json --output runs/casmi/validation.json
+python -m spec2graph.scripts.casmi_predict  --checkpoint runs/casmi/epoch_010.pt --pool assets/casmi/pool.npz --ranker runs/casmi/ranker.json --test-parquet data/test.parquet --output submission.csv
+```
+
+See [docs/17_casmi_competition.md](./docs/17_casmi_competition.md). The
+competition data is CC BY-NC 4.0 and must not be committed.
+
 ## License
 
 MIT License
