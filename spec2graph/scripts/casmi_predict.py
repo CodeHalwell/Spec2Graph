@@ -28,9 +28,11 @@ def main(argv=None) -> int:  # pragma: no cover - wiring only
     p.add_argument("--n-steps", type=int, default=50)
     p.add_argument("--no-projection", action="store_true")
     p.add_argument("--limit", type=int, default=None, help="development knob: first N molecules only")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    if a.device == "mps":
+        torch.backends.mha.set_fastpath_enabled(False)  # the encoder's eval fast path needs an op MPS lacks
 
     predictor = Predictor.load(a.checkpoint, a.pool, a.ranker, a.bond_sgno, a.device, ppm=a.ppm, n_samples=a.n_samples,
                                n_steps=a.n_steps, use_projection=not a.no_projection)

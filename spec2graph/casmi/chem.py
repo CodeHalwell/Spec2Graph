@@ -37,12 +37,20 @@ def mol(smiles: object, canonical_tautomer: bool = False) -> Optional[Chem.Mol]:
 
 @functools.lru_cache(maxsize=1 << 16)
 def inchikey14(smiles: Optional[str]) -> Optional[str]:
-    """Tautomer-canonical InChIKey first block: the competition's structure identity."""
-    m = mol(smiles, canonical_tautomer=True)
+    """The metric notebook's ``canonicalize_smiles_to_ik14``: stereo stripped, then tautomer-canonical InChIKey first block.
+
+    Stripping first matters: a stereocentre can pin a double bond, so the same skeleton drawn with and without it
+    would otherwise canonicalise to different tautomers and different keys.
+    """
+    m = mol(smiles)
     if m is None:
         return None
-    with rdBase.BlockLogs():
-        key = Chem.MolToInchiKey(m)
+    try:
+        with rdBase.BlockLogs():
+            Chem.RemoveStereochemistry(m)
+            key = Chem.MolToInchiKey(_TAUTOMERS.Canonicalize(m))
+    except (ValueError, RuntimeError, TypeError):
+        return None
     return key[:14] if len(key) >= 14 else None
 
 

@@ -79,8 +79,8 @@ spectra of one molecule ──► CasmiModel.encode ──► conditioned memory
   formulas within a ppm window, and `DeNovo` samples, assigns elements with
   the core Hungarian step, rejects disconnected graphs and ranks by
   frequency. Hooked into prediction behind `--bond-sgno`.
-* **Metric** (`metric.py`, `chem.py`). Tautomer canonicalisation +
-  InChIKey14, MRR@25, and a `Submission` class that enforces the rejection
+* **Metric** (`metric.py`, `chem.py`). Stereo removal, then tautomer
+  canonicalisation + InChIKey14 (ported from the metric notebook), MRR@25, and a `Submission` class that enforces the rejection
   rules. Standard InChI puts (de)protonation in the `/p` layer, so an acid
   and its anion share a key. `chem.py` holds the shared RDKit helpers
   (length-guarded parsing, structure records, kekulised adjacency).

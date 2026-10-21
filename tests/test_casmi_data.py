@@ -22,11 +22,21 @@ def test_prepare_and_load(casmi_frame, tmp_path):
     assert np.isnan(df[df["molecule_id"] == "m_bad_adduct"]["neutral_mass"].iloc[0]) and (df[df["adduct"] == "[M-H]-"]["polarity"] == -1).all()
     with pytest.raises(RuntimeError):
         data.prepare(casmi_frame.drop(columns=["adduct"]))
+    with pytest.raises(RuntimeError):
+        data.prepare(casmi_frame.drop(columns=["molecule_id"]))
+    keyed = data.prepare(casmi_frame.drop(columns=["molecule_id"]).assign(inchikey14="AAWZDTNXLSGCEK"))
+    assert keyed["molecule_id"].value_counts().to_dict() == {"synthetic:AAWZDTNXLSGCEK:0": 16, "synthetic:AAWZDTNXLSGCEK:1": 1}
     casmi_frame.to_parquet(tmp_path / "train.parquet", index=False)
     loaded = data.load(tmp_path / "train.parquet", require_smiles=True)
     assert len(loaded) == len(casmi_frame) and isinstance(loaded["mzs"].iloc[0], np.ndarray)
+    assert loaded["collision_energy"].dtype == np.float64 and loaded["collision_energy"].notna().any()
     groups = data.by_molecule(df)
     assert set(groups) == set(df["molecule_id"]) and (df.iloc[groups["m_ethanol"]]["molecule_id"] == "m_ethanol").all()
+
+
+def test_mean_energy():
+    values = ([20.0], np.array([20.0, 40.0, 60.0, 80.0]), None, [], [np.nan, 30.0], 35.0, "35HCD")
+    np.testing.assert_allclose([data.mean_energy(v) for v in values], [20.0, 50.0, np.nan, np.nan, 30.0, 35.0, np.nan])
 
 
 def test_peaks():
@@ -43,8 +53,11 @@ def test_structures():
     table = data.structures(["CCO", "OCC", "c1ccccc1", "garbage", "Oc1ccccn1", "O=c1cccc[nH]1"], source="unit")
     assert len(table) == 3 and table["inchikey14"].is_unique and (table["source"] == "unit").all()
     ethanol = table[table["formula"] == "C2H6O"].iloc[0]
-    assert ethanol["n_inputs"] == 2 and ethanol["input_smiles"] == "CCO"
-    assert len(data.merge_structures([table, data.structures(["CCO", "CCN"])])) == 4
+    assert ethanol["n_inputs"] == 2 and ethanol["aliases"] == ["CCO", "OCC"]
+    merged = data.merge_structures([table, data.structures(["C(O)C", "CCN"], source="extra")])
+    ethanol = merged[merged["formula"] == "C2H6O"].iloc[0]
+    assert len(merged) == 4 and merged["inchikey14"].is_unique and ethanol["source"] == "unit"
+    assert ethanol["aliases"] == ["CCO", "OCC", "C(O)C"] and ethanol["n_inputs"] == 3
 
 
 def test_spectral_descriptors(tmp_path):
@@ -94,3 +107,11 @@ def test_dataset_and_collator(casmi_frame, tmp_path):
     assert batch.quantiles.shape == (4, N_Q) and batch.meta["molecule_id"][0] == "m_ethanol" and len(batch.adjacencies) == 4
     assert batch.to("cpu").core.x_0.shape == batch.core.x_0.shape
     assert data.Dataset(casmi_frame, cache, vocab, max_atoms=6).drops["atom count"] > 0
+
+
+def test_dataset_keeps_every_spelling_of_a_structure(casmi_frame, tmp_path):
+    glucose = casmi_frame.index[casmi_frame["molecule_id"] == "m_glucose"]
+    casmi_frame.loc[glucose[1], "normalized_smiles"] = "OC[C@H]1OC(O)[C@H](O)[C@@H](O)[C@@H]1O"
+    ds = data.Dataset(casmi_frame, spectral.SpectralCache(tmp_path, k=K, fingerprint_bits=FP_BITS), AdductVocabulary.fit(casmi_frame["adduct"]),
+                      max_atoms=MAX_ATOMS, n_quantiles=N_Q)
+    assert ds.drops == {"unsupported adduct": 1}

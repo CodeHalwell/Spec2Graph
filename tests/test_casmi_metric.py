@@ -18,6 +18,7 @@ def test_inchikey14_matches_competition_rules():
     assert chem.inchikey14(GLUCOSE[0]) == chem.inchikey14(GLUCOSE[1]) == "WQZGKKKJIJFFOK"  # stereo ignored
     assert chem.inchikey14("Oc1ccccn1") == chem.inchikey14("O=c1cccc[nH]1")  # tautomers collapse
     assert chem.inchikey14("CC(=O)[O-]") == chem.inchikey14("CC(=O)O")  # /p layer sits outside the first block
+    assert chem.inchikey14("C=C(C)C1CCC2CCC(=O)C=C2C1") == chem.inchikey14("C=C(C)[C@@H]1CCC2CCC(=O)C=C2C1")  # metric notebook regression
     assert all(chem.inchikey14(s) is None for s in ("not a smiles", "", None, "C" * 5000))
 
 

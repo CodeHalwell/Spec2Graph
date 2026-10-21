@@ -17,7 +17,8 @@ K, MAX_ATOMS, MAX_PEAKS, FP_BITS, N_Q = 4, 16, 32, 64, 8
 
 
 def make_casmi_frame(seed: int = 0, n_spectra_per_molecule: int = 2) -> pd.DataFrame:
-    """``train.parquet``-shaped frame with the Kaggle column names, both polarities and one unsupported adduct."""
+    """``train.parquet``-shaped frame with the Kaggle column names and list-valued collision energies (some merged, some
+    null), both polarities and one unsupported adduct."""
     from rdkit import Chem
     from rdkit.Chem import Descriptors
 
@@ -32,10 +33,10 @@ def make_casmi_frame(seed: int = 0, n_spectra_per_molecule: int = 2) -> pd.DataF
             n = int(rng.integers(5, 12))
             intensities = rng.uniform(0.05, 1.0, n)
             rows.append(dict(molecule_id=molecule_id, precursor_mz=precursor, adduct=adduct,
-                             collision_energy_ev=float(rng.choice([10.0, 20.0, 40.0])) if j % 2 == 0 else np.nan,
+                             collision_energy_ev=None if j % 2 else [float(rng.choice([10.0, 20.0, 40.0]))] + ([60.0] if i % 3 == 0 else []),
                              ms2_mzs=np.sort(rng.uniform(15.0, max(precursor - 1.0, 16.0), n)), ms2_normalized_intensities=intensities / intensities.max(),
                              normalized_smiles=smiles, instrument_type="timsTOF", ingest_lib="synthetic"))
-    rows.append(dict(molecule_id="m_bad_adduct", precursor_mz=123.0, adduct="[M+Xx]+", collision_energy_ev=20.0,
+    rows.append(dict(molecule_id="m_bad_adduct", precursor_mz=123.0, adduct="[M+Xx]+", collision_energy_ev=[20.0],
                      ms2_mzs=np.array([20.0, 40.0, 60.0, 80.0, 100.0]), ms2_normalized_intensities=np.array([0.2, 0.4, 1.0, 0.3, 0.1]),
                      normalized_smiles="CCN", instrument_type="timsTOF", ingest_lib="synthetic"))
     return pd.DataFrame(rows)

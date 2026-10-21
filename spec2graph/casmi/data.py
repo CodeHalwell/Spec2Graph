@@ -36,6 +36,7 @@ ALIASES = {
     "library": ("ingest_lib", "library", "source"),
 }
 REQUIRED = ("molecule_id", "precursor_mz", "adduct", "mzs", "intensities")
+MAX_SPECTRA_PER_MOLECULE = 16  # the most spectra any test-set molecule has
 
 
 def prepare(df: pd.DataFrame, require_smiles: bool = False) -> pd.DataFrame:
@@ -46,14 +47,32 @@ def prepare(df: pd.DataFrame, require_smiles: bool = False) -> pd.DataFrame:
         if canon not in df.columns and (found := next((lower[a] for a in aliases if a in lower), None)):
             rename[found] = canon
     out = df.rename(columns=rename).copy()
-    if missing := [c for c in REQUIRED + (("smiles",) if require_smiles else ()) if c not in out.columns]:
+    if "molecule_id" not in out.columns and "inchikey14" in out.columns:
+        out["molecule_id"] = molecule_ids(out)
+    if missing :=[c for c in REQUIRED + (("smiles",) if require_smiles else ()) if c not in out.columns]:
         raise RuntimeError(f"competition schema mismatch; missing {missing}")
-    if "collision_energy" not in out.columns:
-        out["collision_energy"] = np.nan
+    out["collision_energy"] = [mean_energy(v) for v in out["collision_energy"]] if "collision_energy" in out.columns else np.nan
     out["molecule_id"] = out["molecule_id"].astype(str)
     out["neutral_mass"] = [neutral_mass(mz, a) for mz, a in zip(out["precursor_mz"], out["adduct"])]
     out["polarity"] = [a.polarity if (a := try_parse(ad)) else 0 for ad in out["adduct"]]
     return out.reset_index(drop=True)
+
+
+def molecule_ids(df: pd.DataFrame) -> pd.Series:
+    """``library:inchikey14:chunk`` for ``train.parquet``, which has no ``molecule_id``: each structure's spectra in a
+    library, split into molecules of at most ``MAX_SPECTRA_PER_MOLECULE`` like the test set's."""
+    group = (df["library"].astype(str) + ":" if "library" in df.columns else "") + df["inchikey14"].astype(str)
+    return group + ":" + (group.groupby(group).cumcount() // MAX_SPECTRA_PER_MOLECULE).astype(str)
+
+
+def mean_energy(value: object) -> float:
+    """Kaggle's ``collision_energy_ev`` is a list (several values = merged acquisitions): its finite mean, else NaN."""
+    try:
+        values = np.asarray(value, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return float("nan")
+    values = values[np.isfinite(values)]
+    return float(values.mean()) if values.size else float("nan")
 
 
 def load(path: str | Path, require_smiles: bool = False) -> pd.DataFrame:
@@ -98,19 +117,27 @@ class Peaks:
 
 def structures(smiles: Iterable[object], canonical_tautomer: bool = False, n_jobs: int = 1, progress: bool = False,
                source: Optional[str] = None) -> pd.DataFrame:
-    """One row per InChIKey14: identity, formula, exact mass, heavy-atom count and how many inputs mapped to it."""
+    """One row per InChIKey14: identity, formula, exact mass, heavy-atom count, every input SMILES that mapped to it
+    (``aliases``) and how many inputs did."""
     counts = Counter(s for s in smiles if isinstance(s, str) and s)
     records = chem.parallel_map(partial(chem.record, canonical_tautomer=canonical_tautomer), counts, n_jobs, progress, "structures")
     rows: dict[str, dict] = {}
     for smi, rec in zip(counts, records):
         if rec is not None:
-            row = rows.setdefault(rec["inchikey14"], {**rec, "input_smiles": smi, "n_inputs": 0, "source": source})
+            row = rows.setdefault(rec["inchikey14"], {**rec, "aliases": [], "n_inputs": 0, "source": source})
+            row["aliases"].append(smi)
             row["n_inputs"] += counts[smi]
     return pd.DataFrame(list(rows.values()))
 
 
 def merge_structures(tables: Iterable[pd.DataFrame]) -> pd.DataFrame:
-    return pd.concat(list(tables), ignore_index=True).drop_duplicates("inchikey14").reset_index(drop=True)
+    """One row per InChIKey14: the first table's record, with every table's aliases and input counts pooled."""
+    merged = pd.concat(list(tables), ignore_index=True)
+    grouped = merged.groupby("inchikey14", sort=False)
+    out = merged.drop_duplicates("inchikey14").set_index("inchikey14")
+    out["aliases"] = grouped["aliases"].agg(lambda lists: list(dict.fromkeys(s for aliases in lists for s in aliases)))
+    out["n_inputs"] = grouped["n_inputs"].sum()
+    return out.reset_index()
 
 
 @dataclass
@@ -183,7 +210,13 @@ def _pad(mzs: list[np.ndarray], intensities: list[np.ndarray]) -> tuple[np.ndarr
 
 
 class Dataset(TorchDataset):
-    """Training spectra with cached spectral targets and the conditioning fields."""
+    """Training spectra with cached spectral targets and the conditioning fields.
+
+    Cleaned peaks are stored flat with offsets and the per-spectrum fields as arrays, not as row dicts, so a copy fits
+    in each spawned DataLoader worker.
+    """
+
+    SCALARS = ("precursor_mz", "collision_energy", "neutral_mass", "polarity")
 
     def __init__(self, spectra: pd.DataFrame, cache: SpectralCache, vocab: AdductVocabulary, *, max_atoms: int = 96,
                  n_quantiles: int = N_QUANTILES, peaks: Peaks = Peaks(), table: Optional[pd.DataFrame] = None,
@@ -191,49 +224,61 @@ class Dataset(TorchDataset):
         df = spectra if "neutral_mass" in spectra.columns else prepare(spectra, require_smiles=True)
         self.cache, self.vocab, self.n_quantiles, self.peaks, self.adjacency, self.max_atoms = cache, vocab, n_quantiles, peaks, adjacency, max_atoms
         table = structures(df["smiles"].unique(), n_jobs=n_jobs) if table is None else table
-        lookup = {key: r for r in table.to_dict("records") for key in (r.get("input_smiles"), r["smiles"])}
+        lookup = {key: r for r in table.to_dict("records") for key in (*r["aliases"], r["smiles"])}
         drops: Counter = Counter()
-        self.rows, self.records = [], []
-        for row in df.to_dict("records"):
-            if reason := self._reject(row, lookup.get(row["smiles"])):
+        kept, self.records, self.cached = [], [], {}
+        for row in df[["molecule_id", "smiles", "adduct", "mzs", "intensities", *self.SCALARS]].to_dict("records"):
+            reason, cleaned = self._check(row, rec := lookup.get(row["smiles"]))
+            if reason:
                 drops[reason] += 1
             else:
-                self.rows.append(row)
-                self.records.append(lookup[row["smiles"]])
+                kept.append((row, *cleaned))
+                self.records.append(rec)
+        self._store(kept)
         self.drops = dict(drops)
-        logger.info("Dataset: kept %d of %d spectra; dropped %s", len(self.rows), len(df), self.drops)
+        logger.info("Dataset: kept %d of %d spectra; dropped %s", len(self), len(df), self.drops)
 
-    def _reject(self, row: dict, rec: Optional[dict]) -> Optional[str]:
+    def _check(self, row: dict, rec: Optional[dict]) -> tuple[Optional[str], Optional[tuple[np.ndarray, np.ndarray]]]:
+        """``(drop reason, None)`` or ``(None, cleaned peaks)``."""
         if rec is None:
-            return "unparseable smiles"
+            return "unparseable smiles", None
         if not np.isfinite(row["neutral_mass"]):
-            return "unsupported adduct"
+            return "unsupported adduct", None
         if not 0 < rec["n_heavy_atoms"] <= self.max_atoms:
-            return "atom count"
+            return "atom count", None
         try:
-            mz, _ = self.peaks.from_row(row)
+            cleaned = self.peaks.from_row(row)
         except (ValueError, TypeError):
-            return "bad peaks"
-        if mz.size < self.peaks.min_peaks:
-            return "too few peaks"
-        cached = (self.cache.get_or_compute, self.cache.get_or_compute_fingerprint, self.cache.spectrum)
-        return "cache" if any(f(rec["smiles"], rec["inchikey"]) is None for f in cached) else None
+            return "bad peaks", None
+        if cleaned[0].size < self.peaks.min_peaks:
+            return "too few peaks", None
+        if (key := rec["inchikey"]) not in self.cached:
+            lookups = (self.cache.get_or_compute, self.cache.get_or_compute_fingerprint, self.cache.spectrum)
+            self.cached[key] = all(f(rec["smiles"], key) is not None for f in lookups)
+        return (None, cleaned) if self.cached[key] else ("cache", None)
+
+    def _store(self, kept: list[tuple[dict, np.ndarray, np.ndarray]]) -> None:
+        flat = lambda i: np.concatenate([k[i] for k in kept]).astype(np.float32) if kept else np.zeros(0, np.float32)
+        self.mz, self.intensity = flat(1), flat(2)
+        self.offsets = np.cumsum([0, *(mz.size for _, mz, _ in kept)], dtype=np.int64)
+        self.molecule_ids = [row["molecule_id"] for row, _, _ in kept]
+        self.adduct_index = np.array([self.vocab.encode(row["adduct"]) for row, _, _ in kept], dtype=np.int64)
+        self.scalars = {name: np.array([row[name] for row, _, _ in kept], dtype=np.float64) for name in self.SCALARS}
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self.records)
 
     def __getitem__(self, i: int) -> dict[str, Any]:
-        row, rec = self.rows[i], self.records[i]
+        rec, (start, stop) = self.records[i], self.offsets[i : i + 2]
         smiles, key = rec["smiles"], rec["inchikey"]
-        mz, intensity = self.peaks.from_row(row)
         eigvecs, atoms = self.cache.get_or_compute(smiles, key), chem.symbols(smiles)
         sample = dict(
-            eigvecs=eigvecs, n_atoms=eigvecs.shape[0], mz=mz, intensity=intensity, precursor_mz=float(row["precursor_mz"]),
+            eigvecs=eigvecs, n_atoms=eigvecs.shape[0], mz=self.mz[start:stop], intensity=self.intensity[start:stop],
             fingerprint=self.cache.get_or_compute_fingerprint(smiles, key), atom_types=np.asarray(atom_types_to_indices(atoms), dtype=np.int64),
             atom_symbols=atoms, smiles=smiles, formula=rec["formula"], inchikey=key, inchikey14=rec["inchikey14"],
-            molecule_id=row["molecule_id"], adduct_index=self.vocab.encode(row["adduct"]), collision_energy=row.get("collision_energy"),
-            neutral_mass=float(row["neutral_mass"]), polarity=float(row["polarity"]),
+            molecule_id=self.molecule_ids[i], adduct_index=int(self.adduct_index[i]),
             spectral_quantiles=quantiles(self.cache.spectrum(smiles, key), self.n_quantiles),
+            **{name: float(values[i]) for name, values in self.scalars.items()},
         )
         if self.adjacency:
             sample["adjacency"] = chem.kekulized_adjacency(smiles)
@@ -263,6 +308,10 @@ class Collator:
     def __init__(self, max_atoms: int, max_peaks: int, k: int, fingerprint_bits: int, device: str = "cpu"):
         self.core = make_training_batch_collator(max_atoms=max_atoms, max_peaks=max_peaks, k=k, fingerprint_bits=fingerprint_bits, device=device)
         self.device = device
+        self.args = (max_atoms, max_peaks, k, fingerprint_bits, device)
+
+    def __reduce__(self):  # the core collator is a closure; rebuild it so spawned DataLoader workers can unpickle this
+        return Collator, self.args
 
     def __call__(self, samples: list[dict]) -> Batch:
         samples = [s for s in samples if s["n_atoms"] > 0 and np.size(s["mz"]) > 0]

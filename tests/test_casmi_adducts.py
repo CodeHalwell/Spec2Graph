@@ -23,6 +23,13 @@ def test_charges_multipliers_and_aliases():
     assert parse_adduct("[M-2H]2-").polarity == -1 and parse_adduct("[M+K]+").polarity == 1
 
 
+def test_competition_test_set_adducts():
+    names = ("[M+H]+", "[M+NH4]+", "[M-H2O+H]+", "[M-2H2O+H]+", "[M+Na]+", "[M+K]+", "[M-H]-", "[M-H2O-H]-", "[M+CH2O2-H]-", "[M+Cl]-")
+    assert all(try_parse(name) for name in names)
+    assert parse_adduct("[M+CH2O2-H]-").name == "[M+HCOO]-"
+    assert neutral_mass(300.0, "[M-2H2O+H]+") == pytest.approx(300.0 - PROTON_MASS + 2 * 18.0105646863, abs=1e-6)
+
+
 def test_unusable_inputs():
     with pytest.raises(ValueError):
         parse_adduct("[M+Xx]+")

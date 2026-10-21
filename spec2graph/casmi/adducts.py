@@ -22,7 +22,7 @@ COMPONENT_MASSES = {
 }
 ALIASES = {
     "[M+FA-H]-": "[M+HCOO]-", "[M+HCOOH-H]-": "[M+HCOO]-", "[M+Hac-H]-": "[M+CH3COO]-", "[M+HAc-H]-": "[M+CH3COO]-",
-    "[M+CH3COOH-H]-": "[M+CH3COO]-", "[M-H2O+H]+": "[M+H-H2O]+", "[M-H2O-H]-": "[M-H-H2O]-", "[M]+.": "[M]+", "[M]-.": "[M]-",
+    "[M+CH3COOH-H]-": "[M+CH3COO]-", "[M+CH2O2-H]-": "[M+HCOO]-", "[M-H2O+H]+": "[M+H-H2O]+", "[M-H2O-H]-": "[M-H-H2O]-", "[M]+.": "[M]+", "[M]-.": "[M]-",
 }
 _ADDUCT = re.compile(r"^\[(\d*)M((?:[+-]\d*[A-Za-z][A-Za-z0-9]*)*)\](?:(\d*)([+-])|([+-])(\d*))$")
 _TOKEN = re.compile(r"([+-])(\d*)([A-Za-z][A-Za-z0-9]*)")

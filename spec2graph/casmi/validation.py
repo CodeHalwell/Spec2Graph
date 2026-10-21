@@ -13,7 +13,7 @@ from typing import Iterable, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from spec2graph.casmi.chem import inchikey14
+from spec2graph.casmi.chem import inchikey14, parallel_map
 from spec2graph.casmi.metric import bootstrap_ci, reciprocal_ranks
 from spec2graph.casmi.pool import CandidatePool
 from spec2graph.casmi.predict import Predictor
@@ -22,9 +22,11 @@ from spec2graph.casmi.scoring import CandidateScores
 logger = logging.getLogger(__name__)
 
 
-def with_keys(df: pd.DataFrame) -> pd.DataFrame:
-    """Copy with an ``inchikey14`` column derived from ``smiles``."""
-    return df.assign(inchikey14=pd.Series([inchikey14(s) for s in df["smiles"]], index=df.index, dtype=object))
+def with_keys(df: pd.DataFrame, n_jobs: int = 1) -> pd.DataFrame:
+    """Copy with an ``inchikey14`` column derived from ``smiles``, computed once per distinct SMILES."""
+    unique = df["smiles"].unique()
+    keys = dict(zip(unique, parallel_map(inchikey14, unique, n_jobs)))
+    return df.assign(inchikey14=pd.Series([keys.get(s) for s in df["smiles"]], index=df.index, dtype=object))
 
 
 def split_keys(keys: Iterable[str], holdout_fraction: float = 0.1, seed: int = 0) -> tuple[set[str], set[str]]:

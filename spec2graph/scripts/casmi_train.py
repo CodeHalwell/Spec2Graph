@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from spec2graph.casmi import data, validation
 from spec2graph.casmi.adducts import AdductVocabulary
@@ -32,7 +34,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.add_argument(name, required=True, type=Path)
     ints = dict(epochs=10, batch_size=64, d_model=256, nhead=8, num_encoder_layers=4, num_decoder_layers=4, dim_feedforward=1024,
                 k=8, max_atoms=96, max_peaks=128, fingerprint_bits=2048, n_quantiles=32, n_timesteps=1000, bond_hidden_dim=128,
-                bond_layers=3, num_workers=0, seed=0)
+                bond_layers=3, num_workers=2, n_jobs=os.cpu_count() or 1, seed=0)
     floats = dict(holdout_fraction=0.05, lr=1e-4, projection_weight=1.0, orthonormality_weight=0.0, fingerprint_weight=0.5,
                   atom_count_weight=0.05, atom_type_weight=0.5, quantile_weight=1.0, grad_clip=1.0)
     for name, default in {**ints, **floats}.items():
@@ -40,7 +42,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--max-train-rows", type=int, default=None, help="development knob")
     for flag in ("--train-bond-sgno", "--sqrt-intensity", "--heads-only"):
         p.add_argument(flag, action="store_true")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     return p.parse_args(argv)
 
 
@@ -59,7 +61,7 @@ def build(a: argparse.Namespace, vocab: AdductVocabulary) -> tuple[CasmiTrainer,
 def train_epoch(loader, trainer: CasmiTrainer, optimiser, bond, bond_optimiser, a: argparse.Namespace) -> str:
     """One pass over the loader; returns the mean loss components as a log string."""
     totals, bond_losses, n = {}, [], 0
-    for batch in loader:
+    for batch in tqdm(loader, desc="train", unit="batch", mininterval=30):
         batch = batch.to(a.device)
         loss, parts = trainer.train_step(optimiser, batch, return_components=True, grad_clip=a.grad_clip)
         for key, value in {**parts, "total": loss}.items():
@@ -80,7 +82,7 @@ def main(argv=None) -> int:  # pragma: no cover - wiring only
 
     vocab = AdductVocabulary.load(a.assets_dir / "adducts.json")
     table = pd.read_parquet(a.assets_dir / "structures.parquet") if (a.assets_dir / "structures.parquet").exists() else None
-    train = validation.with_keys(data.load(a.train_parquet, require_smiles=True).iloc[: a.max_train_rows])
+    train = validation.with_keys(data.load(a.train_parquet, require_smiles=True).iloc[: a.max_train_rows], a.n_jobs)
     _, holdout_keys = validation.split_keys(train["inchikey14"], a.holdout_fraction, a.seed)
     train_df, holdout_df = validation.split_frame(train, holdout_keys)
     (a.output_dir / "holdout_keys.json").write_text(json.dumps(sorted(holdout_keys)))
@@ -88,8 +90,9 @@ def main(argv=None) -> int:  # pragma: no cover - wiring only
 
     cache = SpectralCache(a.cache_dir, k=a.k, fingerprint_bits=a.fingerprint_bits)
     dataset = data.Dataset(train_df, cache, vocab, max_atoms=a.max_atoms, n_quantiles=a.n_quantiles, table=table,
-                           peaks=data.Peaks(top_k=a.max_peaks, sqrt_intensity=a.sqrt_intensity), adjacency=a.train_bond_sgno, n_jobs=max(1, a.num_workers))
-    loader = DataLoader(dataset, batch_size=a.batch_size, shuffle=True, num_workers=a.num_workers,
+                           peaks=data.Peaks(top_k=a.max_peaks, sqrt_intensity=a.sqrt_intensity), adjacency=a.train_bond_sgno, n_jobs=a.n_jobs)
+    del table, train, train_df, holdout_df  # the dataset keeps compact copies; these frames would pin ~20 GB for the whole run
+    loader =DataLoader(dataset, batch_size=a.batch_size, shuffle=True, num_workers=a.num_workers, persistent_workers=a.num_workers > 0,
                         collate_fn=data.Collator(a.max_atoms, a.max_peaks, a.k, a.fingerprint_bits))
     trainer, config = build(a, vocab)
     optimiser = torch.optim.AdamW(trainer.wrapper.parameters(), lr=a.lr)

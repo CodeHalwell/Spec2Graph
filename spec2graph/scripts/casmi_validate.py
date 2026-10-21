@@ -10,10 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
+import pandas as pd
 import torch
 
 from spec2graph.casmi import data, validation
@@ -22,6 +25,13 @@ from spec2graph.casmi.ranker import LinearRanker
 from spec2graph.casmi.scoring import FEATURES
 
 log = logging.getLogger(__name__)
+
+
+def sample_molecules(frame: pd.DataFrame, n: Optional[int], seed: int) -> pd.DataFrame:
+    """Rows of ``n`` randomly chosen molecules (all of them when ``n`` is ``None``)."""
+    ids = list(dict.fromkeys(frame["molecule_id"]))
+    np.random.default_rng(seed).shuffle(ids)
+    return frame[frame["molecule_id"].isin(ids[:n])].reset_index(drop=True)
 
 
 def main(argv=None) -> int:  # pragma: no cover - wiring only
@@ -37,23 +47,22 @@ def main(argv=None) -> int:  # pragma: no cover - wiring only
     p.add_argument("--n-samples", type=int, default=8)
     p.add_argument("--n-steps", type=int, default=50)
     p.add_argument("--no-projection", action="store_true")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    if a.device == "mps":
+        torch.backends.mha.set_fastpath_enabled(False)  # the encoder's eval fast path needs an op MPS lacks
 
     predictor = Predictor.load(a.checkpoint, a.pool, a.ranker, a.bond_sgno, a.device, ppm=a.ppm, n_samples=a.n_samples,
                                n_steps=a.n_steps, use_projection=not a.no_projection)
-    train = validation.with_keys(data.load(a.train_parquet, require_smiles=True))
+    train = validation.with_keys(data.load(a.train_parquet, require_smiles=True), os.cpu_count() or 1)
     keys = set(json.loads(a.holdout_keys.read_text())) if a.holdout_keys else validation.split_keys(train["inchikey14"], a.holdout_fraction, a.seed)[1]
     _, holdout = validation.split_frame(train, keys)
-    molecules = list(dict.fromkeys(holdout["molecule_id"]))
-    np.random.default_rng(a.seed).shuffle(molecules)
-    molecules = molecules[: a.limit_molecules]
-    half = len(molecules) // 2 if a.fit_ranker else 0
-    frame = lambda ids: holdout[holdout["molecule_id"].isin(ids)].reset_index(drop=True)
+    fit_keys, eval_keys = validation.split_keys(holdout["inchikey14"], 0.5, a.seed) if a.fit_ranker else (set(), set(holdout["inchikey14"]))
+    frame = lambda structures: sample_molecules(holdout[holdout["inchikey14"].isin(structures)], a.limit_molecules, a.seed)
 
     if a.fit_ranker:
-        fit = frame(molecules[:half])
+        fit = frame(fit_keys)
         _, scores = predictor.predict_frame(fit, progress=True)
         groups = validation.training_groups(scores, predictor.pool, validation.truth_map(fit))
         try:
@@ -63,7 +72,7 @@ def main(argv=None) -> int:  # pragma: no cover - wiring only
         predictor.ranker.save(a.fit_ranker)
         log.info("ranker weights: %s", dict(zip(FEATURES, np.round(predictor.ranker.weights, 3))))
 
-    reports = validation.validate(predictor, frame(molecules[half:]), progress=True)
+    reports = validation.validate(predictor, frame(eval_keys), progress=True)
     for report in reports.values():
         print(report)
     a.output.parent.mkdir(parents=True, exist_ok=True)

@@ -17,3 +17,4 @@ submission.csv
 
 # Test / tooling caches
 .pytest_cache/
+__marimo__/
