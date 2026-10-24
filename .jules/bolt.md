@@ -43,3 +43,7 @@
 ## 2026-10-20 - [Optimize pd.iterrows with to_dict('records')]
 **Learning:** Iterating over pandas DataFrames with `iterrows()` has massive performance overhead because it creates a new `pd.Series` object for every single row. `itertuples()` is faster but can silently mangle column names with invalid Python identifiers (like `m/z` to `_1`).
 **Action:** Use `zip(df.index, df.to_dict('records'))` for a significant, safe performance boost while preserving exact column names in dictionaries. Ensure downstream helper functions are updated to accept `dict[str, Any]` instead of just `pd.Series`.
+
+## 2025-02-23 - [Optimize diagonal zeroing in class logits]
+**Learning:** In PyTorch, using `torch.eye(N)` and `masked_fill` to zero the diagonal of a batched prediction matrix `(B, N, N, C)` allocates a large boolean mask and performs expensive operations, causing an O(N^2) overhead per forward pass.
+**Action:** Instead, use `.clone()` followed by `.diagonal(dim1=1, dim2=2)` to get a view of the diagonal (shape `(B, C, N)`), and use `.fill_(0.0)` for general zeroing and `.fill_(value)` for class-specific diagonal initialization. This completely avoids materializing the O(N^2) mask and significantly improves forward pass speed.
