@@ -43,9 +43,15 @@ class BondTypeSGNO(nn.Module):
         h_i, h_j = self.proj_i(eigvecs) + self.elem_i(elements), self.proj_j(eigvecs) + self.elem_j(elements)
         logits = self.mlp(h_i.unsqueeze(2) + h_j.unsqueeze(1))
         logits = 0.5 * (logits + logits.transpose(1, 2))
-        eye = torch.eye(logits.shape[1], dtype=torch.bool, device=logits.device)[None, :, :, None]
-        none_class = torch.arange(N_CLASSES, device=logits.device) == 0
-        return logits.masked_fill(eye, 0.0).masked_fill(eye & none_class, 1e4)  # diagonal = "no bond"
+
+        # OPTIMIZATION: Avoid materializing an O(N^2) eye mask and boolean operations.
+        # Instead, clone the logits and update the diagonal in-place using .diagonal().
+        # We zero out the entire diagonal, then set the "none class" (index 0) to 1e4.
+        out = logits.clone()
+        d = out.diagonal(dim1=1, dim2=2)  # Shape: (batch, n_classes, n_atoms)
+        d.fill_(0.0)
+        d[:, 0, :].fill_(1e4)
+        return out  # diagonal = "no bond"
 
     def probabilities(self, eigvecs: torch.Tensor, elements: torch.Tensor) -> torch.Tensor:
         return self(eigvecs, elements).softmax(-1)
